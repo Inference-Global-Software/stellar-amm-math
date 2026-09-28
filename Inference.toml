@@ -1,0 +1,14 @@
+[package]
+name = "stellar-amm-math"
+version = "0.1.0"
+infc_version = "0.0.6"
+description = "Uniswap V2 constant-product AMM math as a Stellar smart contract, in Inference"
+
+# The stellar target emits a Soroban contract: compile mode only, no
+# [build.wasm-opt], and only u32, i32 and bool may cross the contract
+# boundary. It refuses proof mode: `infs build -v` fails and empties out/,
+# removing out/main.wasm (restore it with `infs build`). src/main.inf gives
+# the infc command that builds the proof.
+[build]
+target = "stellar"
+mode = "compile"

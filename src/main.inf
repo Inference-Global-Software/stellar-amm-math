@@ -1,0 +1,1078 @@
+// Uniswap V2 constant-product AMM math, compiled to a Stellar (Soroban)
+// smart contract.
+//
+// Start here. `infs build` writes out/main.wasm, the deployable contract;
+// deploy it with `stellar contract deploy --wasm out/main.wasm ...`, and
+//   stellar contract invoke ... -- get_amount_out --amount_in 1000 \
+//     --reserve_in 100000 --reserve_out 100000 --fee_bps 30
+// returns 987. `infs install` provides infc, which builds the proof
+// obligations (see Specifications) into any directory but out/, where its
+// main.wasm would replace the contract:
+//   infc src/main.inf --target wasm32 -v --out-dir proof
+// Below, in order: What this contract is, Why every amount is a u32,
+// Formulas, Not provided, Refusals, Specifications.
+//
+// What this contract is. It is the pricing core a stateful pool delegates
+// to: swap quotes, liquidity minting and burning, and the constant-product
+// (k) check, as pure functions of the reserves and amounts the caller passes
+// in. It holds no state and moves no tokens. It is stateless because the
+// Stellar target of Inference v0.0.6 binds no host functions: storage,
+// token transfers, authorization and cross-contract calls all arrive as
+// Soroban host imports, and the target refuses them until the host-call
+// convention is bound (Inferara/inference#324, #472).
+//
+// Every `pub fn` in this file is a contract method, called as
+// `stellar contract invoke ... -- get_amount_out --amount_in 1000 ...`. A
+// parameter's name is its CLI flag and part of the contract's interface.
+// `pub` in wide.inf and model.inf only lets another file import a function:
+// nothing outside this file is exported, although every function of both
+// files ships in the contract (the compiler eliminates no dead code). A
+// failing `assert` aborts the call, like Solidity's `require` without a
+// message.
+//
+// Why every amount is a u32. Only u32, i32 and bool cross the v0.0.6 Stellar
+// boundary. A Soroban u64, i64 or i128 may travel as a host object, which the
+// target cannot build or read without host calls. A u32 amount is at most
+// 4294967295 smallest units: at the 7 decimals Stellar assets use, about 429
+// whole tokens. Intermediate products are formed exactly in 128 bits
+// (wide.inf), so the u32 bound applies to arguments and results only, and a
+// pool must keep every balance it stores within it (see the
+// 'UniswapV2: OVERFLOW' entry under Refusals below).
+//
+// Formulas. Fees are in basis points: D = 10000, f = fee_bps, and
+// G = D - f is the share of an input that counts after the fee (gamma * D
+// in the usual AMM notation, where gamma = 1 - fee). Lower-case k is always
+// the constant product that the k checks compare. fee_bps = 30 gives
+// G = 9970, which is V2's 997/1000 scaled by ten. The scale cancels in every
+// quotient and in the k comparison, so fee_bps = 30 reproduces V2's results
+// exactly.
+//   get_amount_out     floor(a*G*Ro / (Ri*D + a*G))              rounds down
+//   get_amount_in      floor(Ri*x*D / ((Ro-x)*G)) + 1            V2's +1
+//   quote              floor(a*Rb / Ra)                          rounds down
+//   mint_initial       floor(sqrt(a0*a1)) - 1000                 rounds down
+//   mint_proportional  min(floor(a0*S/R0), floor(a1*S/R1))       rounds down
+//   burn_share         floor(l*B / S)                            rounds down
+//   k_holds            (Ri+a)*(Ro-o) >= Ri*Ro
+//   k_holds_with_fee   ((Ri+a)*D - a*f)*(Ro-o) >= Ri*Ro*D
+//   mul_div            floor(a*b / d)                            rounds down
+//   mul_div_up         ceil(a*b / d)                             rounds up
+// The other symbols name parameters:
+//   a          amount_in; amount_a in quote; the first factor in mul_div
+//              and mul_div_up
+//   b, d       the second factor and the denominator in mul_div and
+//              mul_div_up
+//   x          amount_out in get_amount_in
+//   o          amount_out in k_holds and k_holds_with_fee
+//   Ri, Ro     reserve_in, reserve_out
+//   Ra, Rb     reserve_a, reserve_b
+//   a0, a1     amount0, amount1
+//   R0, R1     reserve0, reserve1
+//   l, B, S    liquidity, balance, total_supply
+// The swap, mint and burn roundings all favour the pool; mul_div and
+// mul_div_up offer both directions for a caller's own ratios. get_amount_in's
+// +1 is V2's round-up, which is one unit more than needed whenever the
+// division is exact.
+//
+// k_holds_with_fee is V2's 'UniswapV2: K' check,
+// balance0Adjusted * balance1Adjusted >= reserve0 * reserve1 * 1000^2, for a
+// swap with its input on one side and its output on the other, at D = 10000
+// in place of 1000 and with one factor of D cancelled from both sides;
+// k_holds is the same check at fee 0. V2 reads both sides from the pool's
+// balances after the transfers, so both amounts here are balance changes:
+// amount_in is V2's amountIn, the input side's balance minus its stored
+// reserve, and amount_out is the output side's stored reserve minus its
+// balance. That equals V2's amount1Out only when the transfer out takes
+// exactly amount1Out from the pool and nothing pays into the output side
+// during the swap. When the output side's balance ends above
+// reserve_out - amount1Out (V2's amount1In > 0: a flash swap repaid, even
+// partly, in the borrowed token, a positive rebase, a transfer in during the
+// callback), V2 charges the fee on that inflow and neither argument
+// reproduces its check: reserve - balance returns true where V2 reverts with
+// K, and the requested amount can return false where V2 succeeds. The pool
+// must refuse such a swap: test balance_out > reserve_out - amount1Out
+// before calling the check. A pool that passes the requested amount instead,
+// with a token that takes more from the pool than it delivers (a
+// sender-charged fee, a rebase during the swap), gets true where V2 reverts
+// with 'UniswapV2: K'.
+//
+// The 1000 units mint_initial withholds are the MINIMUM_LIQUIDITY that V2
+// mints to address(0) and locks for good; minimum_liquidity() returns it.
+// V2's totalSupply counts them, so after the first deposit the pool records
+// total_supply = mint_initial(...) + minimum_liquidity(), and that is the
+// supply mint_proportional and burn_share must receive. A pool that records
+// mint_initial(...) alone lets the first provider burn the whole pool. B in
+// burn_share is the pool's current balance of the token, as V2's burn uses
+// (balance0 and balance1, not the stored reserves), so a transfer the pool
+// has not yet synced is paid out pro rata too; mint_proportional, like V2's
+// mint, divides by the stored reserves.
+//
+// Not provided. Three parts of V2's pair have no method here; a pool built
+// on this contract implements or refuses them itself.
+//   - The protocol fee (_mintFee). With it switched on, V2's mint and burn
+//     first mint floor(S*(rootK - rootKLast) / (5*rootK + rootKLast)) to
+//     feeTo when kLast != 0 and rootK > rootKLast, where rootK =
+//     floor(sqrt(R0*R1)), rootKLast = floor(sqrt(kLast)), and kLast is R0*R1
+//     after the last mint or burn made while the fee was on. V2 records
+//     kLast only then, and resets it to 0 at the first mint or burn after the
+//     fee is switched off. The mint or burn then passes the increased supply
+//     to mint_proportional or burn_share. The methods here cannot compute
+//     that fee in general: mint_initial(R0, R1) + minimum_liquidity() gives
+//     rootK only when R0*R1 >= 1001^2, 5*rootK + rootKLast can exceed a
+//     u32, and kLast is a 64-bit product, so a pool that charges the fee
+//     needs its own wide arithmetic.
+//   - Swaps that are not one-sided. The k checks take one input side and one
+//     output side. A swap that pays in on its output side (V2's flash swap
+//     repaid in the borrowed token), or that pays in or out on both sides,
+//     has no check here: the pool refuses it or computes V2's two-sided
+//     check itself. The test balance_out > reserve_out - amount1Out, given
+//     with k_holds_with_fee above, detects a swap that pays in on its output
+//     side.
+//   - The price accumulators (price0CumulativeLast, price1CumulativeLast)
+//     that V2's _update maintains.
+//
+// Refusals. Each row maps a trap, or for the k checks a false result, to the
+// V2 require or revert it mirrors: UniswapV2Library's for get_amount_out,
+// get_amount_in and quote, and UniswapV2Pair's for the mint, burn and k
+// methods, named without their 'UniswapV2Library: ' and 'UniswapV2: '
+// prefixes. mul_div and mul_div_up mirror v3-core's FullMath instead:
+// UniswapV2Library and UniswapV2Pair have no such function, and the mulDiv
+// that v2-periphery takes from @uniswap/lib rounds down only. An entry that
+// is wholly parenthesised has no V2 counterpart and says why: there V2
+// computes in uint256 and returns a value, takes another path, or never
+// receives such an input, so those rows are inputs this contract refuses
+// and V2 does not.
+//   get_amount_out     amount_in > 0              INSUFFICIENT_INPUT_AMOUNT
+//                      both reserves > 0          INSUFFICIENT_LIQUIDITY
+//   get_amount_in      amount_out > 0             INSUFFICIENT_OUTPUT_AMOUNT
+//                      both reserves > 0          INSUFFICIENT_LIQUIDITY
+//                      amount_out < reserve_out   ds-math-sub-underflow, or a
+//                                                 zero divisor at equality
+//                      result fits u32            (a uint256 in V2)
+//   quote              amount_a > 0               INSUFFICIENT_AMOUNT
+//                      both reserves > 0          INSUFFICIENT_LIQUIDITY
+//                      result fits u32            (a uint256 in V2)
+//   mint_initial       floor(sqrt(a0*a1)) >= 1000 ds-math-sub-underflow
+//                      result > 0                 INSUFFICIENT_LIQUIDITY_MINTED
+//   mint_proportional  both reserves > 0          a zero divisor in V2
+//                      total_supply > 0           (at zero supply V2 uses the
+//                                                 mint_initial formula)
+//                      at least one share         (a uint256 in V2)
+//                      fits u32
+//                      result > 0                 INSUFFICIENT_LIQUIDITY_MINTED
+//   burn_share         total_supply > 0           a zero divisor in V2
+//                      liquidity <= total_supply  (V2 burns a balance, which
+//                                                 never exceeds the supply)
+//                      result > 0                 INSUFFICIENT_LIQUIDITY_BURNED
+//                                                 (V2 requires both tokens'
+//                                                 amounts: call burn_share
+//                                                 once per token, and either
+//                                                 trap refuses the burn)
+//   k_holds, k_holds_with_fee
+//                      reserve_in > 0             swap: INSUFFICIENT_LIQUIDITY
+//                                                 (amount0Out < reserve0, where
+//                                                 the input side's output is 0)
+//                      amount_out < reserve_out   with amount_out the balance
+//                                                 change: K (the output side
+//                                                 is drained); with amount_out
+//                                                 the requested amount:
+//                                                 INSUFFICIENT_LIQUIDITY
+//                                                 (amount1Out < reserve1)
+//                      a false result             K (the caller reverts on
+//                                                 false)
+//   mul_div, mul_div_up
+//                      denominator > 0            FullMath (v3-core):
+//                                                 require(denominator > 0)
+//                      result fits u32            require(denominator > prod1),
+//                                                 and result < max before the
+//                                                 rounding-up increment
+// get_amount_in's result includes its +1. fee_bps < 10000 is asserted
+// wherever a fee is taken (get_amount_out, get_amount_in, k_holds_with_fee),
+// with no V2 counterpart: V2's fee is a constant. Three of V2's requires
+// have no row, because they are the pool's: two of swap's, and one of
+// _update's.
+//   - 'UniswapV2: INSUFFICIENT_OUTPUT_AMOUNT' (swap). The k checks accept
+//     amount_out = 0 and return true, where V2's swap reverts, so the pool
+//     refuses a swap that pays nothing out.
+//   - 'UniswapV2: INSUFFICIENT_INPUT_AMOUNT' (swap) needs no check of its
+//     own: with reserve_in > 0 and amount_out > 0, a zero amount_in already
+//     makes both k checks return false.
+//   - 'UniswapV2: OVERFLOW', which _update raises in swap, mint, burn and
+//     sync when a balance exceeds uint112. In each of them the pool must
+//     keep every balance it stores at most 4294967295, and neither k check
+//     tests reserve_in + amount_in.
+// The pool also makes the checks V2 runs on the amounts it derives itself:
+// swap's requested amount1Out against the reserve before the transfer
+// ('UniswapV2: INSUFFICIENT_LIQUIDITY'), and mint's
+// amount0 = balance0 - reserve0 (ds-math-sub-underflow). V2's LOCKED,
+// INVALID_TO and TRANSFER_FAILED requires guard state and transfers, which
+// this contract does not have.
+//
+// Every refusal, every checked-arithmetic overflow and every malformed
+// argument reaches a Soroban caller as one and the same WebAssembly trap:
+// the host reports Error(WasmVm, InvalidAction) with "VM call trapped:
+// UnreachableCodeReached", and a try_ call sees Error(Context,
+// InvalidAction). A zero divisor is no exception: every quotient comes from
+// wide.inf's div_to_u32, whose assert refuses a zero denominator, and the
+// module's only division instructions never divide by zero (wide.inf's
+// header gives the detail), so no failure takes the form of the machine's
+// divide-by-zero trap. A caller cannot tell the failures apart by message;
+// the table above is the only map from a failure back to the input that
+// caused it.
+//
+// Specifications. The PairMath block at the end of this file states the
+// methods' properties as proof obligations. The comment above it explains
+// how to read one and lists the properties it deliberately does not claim.
+// A proof-mode build of this file,
+//   infc src/main.inf --target wasm32 -v --out-dir proof
+// translates them to Rocq as main__PairMath_hspec1 onwards under Theorem
+// valid_main__PairMath (model.inf's WideArith block becomes
+// valid_main__model_WideArith). hspecN is the Nth spec function of its
+// block, counting from 1, and each spec function's comment names its own.
+// Build the proof with infc, not with `infs build -v`: this project's stellar
+// target refuses proof mode, and the failed build empties out/ (restore
+// out/main.wasm with `infs build`). Give infc any --out-dir but out/, which
+// is also its default: there the proof module's main.wasm replaces the
+// contract, and the build still succeeds. `infs install` puts infc on the
+// PATH, in ~/.inference/bin. The proof build checks that every claim is
+// well-formed, not that it is true: the emitted theorems end in Admitted
+// until a proof discharges them, and a false claim compiles just as
+// cleanly. The proof module's executable functions are byte-identical to
+// the deployed contract's; the Stellar value-ABI wrappers the compiler adds
+// around the 11 exports are outside every obligation.
+
+use wide;
+use wide::{U128};
+use model::{widen};
+
+// The liquidity mint_initial withholds from the first provider.
+pub fn minimum_liquidity() -> u32 {
+    return 1000;
+}
+
+// The output a swap of amount_in buys: floor(a*G*Ro / (Ri*D + a*G)).
+// Traps unless amount_in > 0, both reserves > 0 and fee_bps < 10000. On that
+// domain the result is below reserve_out, so the quotient always fits.
+pub fn get_amount_out(amount_in: u32, reserve_in: u32, reserve_out: u32, fee_bps: u32) -> u32 {
+    const D: u32 = 10000;
+    assert(amount_in > 0);
+    assert(reserve_in > 0);
+    assert(reserve_out > 0);
+    assert(fee_bps < D);
+    let g: u32 = D - fee_bps;
+    let ag: U128 = wide::mul32(amount_in, g);
+    let num: U128 = wide::mul_by(ag, reserve_out);
+    let ri_d: U128 = wide::mul32(reserve_in, D);
+    let den: U128 = wide::add(ri_d, ag);
+    return wide::div_to_u32(num, den);
+}
+
+// The input that buys amount_out: floor(Ri*x*D / ((Ro-x)*G)) + 1.
+// Traps unless amount_out > 0, both reserves > 0, amount_out < reserve_out
+// and fee_bps < 10000, and also when the result does not fit a u32 (the
+// quotient itself, or the checked +1 at a quotient of 2^32 - 1).
+pub fn get_amount_in(amount_out: u32, reserve_in: u32, reserve_out: u32, fee_bps: u32) -> u32 {
+    const D: u32 = 10000;
+    assert(amount_out > 0);
+    assert(reserve_in > 0);
+    assert(reserve_out > 0);
+    assert(amount_out < reserve_out);
+    assert(fee_bps < D);
+    let g: u32 = D - fee_bps;
+    let rx: U128 = wide::mul32(reserve_in, amount_out);
+    let num: U128 = wide::mul_by(rx, D);
+    let den: U128 = wide::mul32(reserve_out - amount_out, g);
+    let q: u32 = wide::div_to_u32(num, den);
+    return q + 1;
+}
+
+// The amount of the other token equivalent to amount_a at the current
+// price: floor(a*Rb / Ra). Traps unless amount_a > 0 and both reserves > 0,
+// and when the result does not fit a u32.
+pub fn quote(amount_a: u32, reserve_a: u32, reserve_b: u32) -> u32 {
+    assert(amount_a > 0);
+    assert(reserve_a > 0);
+    assert(reserve_b > 0);
+    let num: U128 = wide::mul32(amount_a, reserve_b);
+    let den: U128 = wide::from_u32(reserve_a);
+    return wide::div_to_u32(num, den);
+}
+
+// The liquidity minted by a pool's first deposit:
+// floor(sqrt(a0*a1)) - minimum_liquidity(), the 1000 units V2 locks. Traps
+// unless the result is positive, i.e. unless a0*a1 >= 1001^2 (the checked
+// subtraction, then the assert). The locked units count towards the supply:
+// the pool records total_supply = result + minimum_liquidity().
+pub fn mint_initial(amount0: u32, amount1: u32) -> u32 {
+    let p: U128 = wide::mul32(amount0, amount1);
+    let s: u32 = wide::isqrt(p);
+    let minted: u32 = s - minimum_liquidity();
+    assert(minted > 0);
+    return minted;
+}
+
+// The liquidity minted by a later deposit:
+// min(floor(a0*S/R0), floor(a1*S/R1)). Traps unless both reserves and
+// total_supply are positive, at least one share fits a u32 (the smaller one
+// then fits too) and the result is positive. A share that does not fit is
+// larger than the one that does, so it is never the minimum and is not
+// computed.
+pub fn mint_proportional(amount0: u32, amount1: u32, reserve0: u32, reserve1: u32, total_supply: u32) -> u32 {
+    assert(reserve0 > 0);
+    assert(reserve1 > 0);
+    assert(total_supply > 0);
+    let n0: U128 = wide::mul32(amount0, total_supply);
+    let d0: U128 = wide::from_u32(reserve0);
+    let n1: U128 = wide::mul32(amount1, total_supply);
+    let d1: U128 = wide::from_u32(reserve1);
+    let fits0: bool = wide::quotient_fits(n0, d0);
+    let fits1: bool = wide::quotient_fits(n1, d1);
+    assert(fits0 || fits1);
+    let mut minted: u32 = 0;
+    if fits0 && fits1 {
+        let q0: u32 = wide::div_to_u32(n0, d0);
+        let q1: u32 = wide::div_to_u32(n1, d1);
+        minted = q0;
+        if q1 < q0 {
+            minted = q1;
+        }
+    } else if fits0 {
+        minted = wide::div_to_u32(n0, d0);
+    } else {
+        minted = wide::div_to_u32(n1, d1);
+    }
+    assert(minted > 0);
+    return minted;
+}
+
+// The amount of one token that burning `liquidity` returns: floor(l*B / S),
+// where B is the pool's current balance of that token (V2's balance0 or
+// balance1, not the stored reserve), so a transfer the pool has not synced
+// is paid out pro rata too. Traps unless total_supply > 0, liquidity <=
+// total_supply and the result is positive. The result never exceeds the
+// balance, so it always fits.
+pub fn burn_share(liquidity: u32, balance: u32, total_supply: u32) -> u32 {
+    assert(total_supply > 0);
+    assert(liquidity <= total_supply);
+    let num: U128 = wide::mul32(liquidity, balance);
+    let den: U128 = wide::from_u32(total_supply);
+    let out: u32 = wide::div_to_u32(num, den);
+    assert(out > 0);
+    return out;
+}
+
+// Whether a swap of amount_in for amount_out keeps the product of the
+// reserves from falling: (Ri+a)*(Ro-o) >= Ri*Ro. Both amounts are the
+// balance changes the header defines, measured after the transfers. Traps
+// unless reserve_in > 0 and amount_out < reserve_out. A zero amount_out
+// returns true, which V2 refuses (INSUFFICIENT_OUTPUT_AMOUNT), so the caller
+// must refuse it.
+pub fn k_holds(amount_in: u32, amount_out: u32, reserve_in: u32, reserve_out: u32) -> bool {
+    assert(reserve_in > 0);
+    assert(amount_out < reserve_out);
+    let ri: U128 = wide::from_u32(reserve_in);
+    let ai: U128 = wide::from_u32(amount_in);
+    let bal_in: U128 = wide::add(ri, ai);
+    let lhs: U128 = wide::mul_by(bal_in, reserve_out - amount_out);
+    let rhs: U128 = wide::mul32(reserve_in, reserve_out);
+    return wide::le(rhs, lhs);
+}
+
+// The same check with the fee charged on the input, in basis points:
+// ((Ri+a)*D - a*f)*(Ro-o) >= Ri*Ro*D. Traps unless fee_bps < 10000,
+// reserve_in > 0 and amount_out < reserve_out. A zero amount_out returns
+// true, as in k_holds, and the caller must refuse it.
+pub fn k_holds_with_fee(amount_in: u32, amount_out: u32, reserve_in: u32, reserve_out: u32, fee_bps: u32) -> bool {
+    const D: u32 = 10000;
+    assert(fee_bps < D);
+    assert(reserve_in > 0);
+    assert(amount_out < reserve_out);
+    let ri: U128 = wide::from_u32(reserve_in);
+    let ai: U128 = wide::from_u32(amount_in);
+    let bal_in: U128 = wide::add(ri, ai);
+    let scaled: U128 = wide::mul_by(bal_in, D);
+    let fee: U128 = wide::mul32(amount_in, fee_bps);
+    let adj: U128 = wide::sub(scaled, fee);
+    let lhs: U128 = wide::mul_by(adj, reserve_out - amount_out);
+    let rr: U128 = wide::mul32(reserve_in, reserve_out);
+    let rhs: U128 = wide::mul_by(rr, D);
+    return wide::le(rhs, lhs);
+}
+
+// floor(a*b / denominator). Traps unless denominator > 0 and the result
+// fits a u32. The parameters are named as in v3-core's
+// FullMath.mulDiv(a, b, denominator).
+pub fn mul_div(a: u32, b: u32, denominator: u32) -> u32 {
+    assert(denominator > 0);
+    let num: U128 = wide::mul32(a, b);
+    let den: U128 = wide::from_u32(denominator);
+    return wide::div_to_u32(num, den);
+}
+
+// ceil(a*b / denominator). Traps unless denominator > 0 and the rounded-up
+// result fits a u32: the floor must fit, and the checked +1 traps when the
+// floor is 2^32 - 1 and the division is not exact. The parameters are named
+// as in mul_div.
+pub fn mul_div_up(a: u32, b: u32, denominator: u32) -> u32 {
+    assert(denominator > 0);
+    let num: U128 = wide::mul32(a, b);
+    let den: U128 = wide::from_u32(denominator);
+    let q: u32 = wide::div_to_u32(num, den);
+    let back: U128 = wide::mul32(q, denominator);
+    if wide::eq(back, num) {
+        return q;
+    }
+    return q + 1;
+}
+
+// Reading a spec. A spec block is proof-only: the deployed contract does not
+// contain it, and a forall body is a claim, not code that runs. Inside a spec
+// function:
+//   let a: u32 = @;          the claim is made for every u32 a
+//   assume { assert(P); }    ...restricted to the inputs where P holds
+//   assert(Q);               the claim
+//   f(x);                    the claim that f(x) returns without trapping
+//   let n: u64 = e;          n abbreviates e, which is substituted at every
+//                            use; a let that no claim uses claims nothing,
+//                            not even that its call returns
+//   if C { assert(P); }      C implies P; an else branch adds that not-C
+//                            implies its own asserts
+// A condition C, like P in an assume, filters only where its own calls
+// return. Where one of them traps, the asserts it guards must hold anyway,
+// so a condition may call a method only inside that method's no-trap
+// domain, as get_amount_out_is_largest_feasible and
+// get_amount_in_overpays_by_at_most_one do. A let costs nothing in the
+// obligation (it is substituted), so the claims below name the quantities
+// their derivations use, such as u, v and floor_nd_q for get_amount_in.
+// A forall body with no @ is a claim about fixed values. widen(x), from
+// model.inf, is x as a u64 (Inference has no numeric conversions), so a u32
+// result can be compared with u64 arithmetic. Outside wrapping(...), +, -
+// and * trap on overflow in a method body, as in Solidity 0.8; in a spec
+// body they wrap. D is a spec-local u64 const wherever a claim computes with
+// it in u64. A u32 term, such as f < 10000 or widen(10000 - f), would need a
+// second const of type u32 (a const has one type, and there are no
+// conversions), so there D is written as the literal 10000.
+//
+// Each spec function's comment gives its scope and the Rocq definition it
+// becomes, main__PairMath_hspecN for the Nth spec function of this block.
+// The scope is one of:
+//   - "the exact no-trap domain": every input on which the methods it calls
+//     return;
+//   - "the part of the exact no-trap domain where ...": the next spec
+//     function covers the rest, unless the comment says where it is covered;
+//   - "the envelope <condition>": a part of that domain, narrowed so that
+//     the formula's u64 terms cannot wrap;
+//   - "fixed values": a body with no @.
+// "..., with <condition>" adds a hypothesis that belongs to the property,
+// such as a1 <= a2 in the claim that paying more never buys less, and not
+// to its scope.
+//
+// Four rules shape every PairMath obligation:
+//   - Each spec function is forall-quantified. An exists or unique body is
+//     compiled and run, and one that reaches checked arithmetic (every method
+//     except the constant minimum_liquidity) is refused (P018): a trap on
+//     that path would make the claim false, not narrower.
+//   - A claim over a call that traps is false, not vacuous. So every claim's
+//     assumptions imply the full precondition of every call it makes,
+//     trap-freedom included. Most claims state it outright. Where an
+//     argument is another method's result, that method's claimed range
+//     supplies it: get_amount_out_returns_below_reserve gives the o < ro
+//     that k_holds_with_fee(a, o, ri, ro, f) needs when
+//     o = get_amount_out(...). An assumption calls only widen, which never
+//     traps, and divides only by terms the assumptions before it keep
+//     nonzero.
+//   - A claim that a method equals a formula pins the value exactly: an
+//     equality with a u64 expression, or a lower and an upper bound. A
+//     one-sided bound would let an off-by-one division through.
+//   - An obligation's arithmetic is the wrapping machine operator, and u64 is
+//     its widest type. Each u64 expression that can decide a claim is kept
+//     below 2^64 by construction or by an assumed envelope; a term that wraps
+//     only where a conjunct beside it is already false cannot change the
+//     conjunction. Where a product can exceed 2^64 (it reaches about 2^77.3
+//     in get_amount_out and get_amount_in, and about 2^78.3 in
+//     k_holds_with_fee), the exact formula splits the division (quotient and
+//     remainder by a u64 divisor, or the reserve by halves) so that it covers
+//     the method's whole no-trap domain with no further envelope: for
+//     get_amount_out and k_holds_with_fee that is every input the method
+//     accepts, and for get_amount_in it is exactly the inputs on which the
+//     result fits.
+//
+// Where a formula can pass 2^64 it is stated twice: <method>_is_exact over
+// the whole no-trap domain in the split form, then
+// <method>_matches_v2_formula, the expression V2's source writes (at
+// D = 10000, and for the k check with one factor of D cancelled), on the
+// envelope where u64 holds it. The second follows from the first; it is
+// kept because it can be checked against V2's source line by line.
+//
+// Four properties are deliberately not claimed.
+//   - 'Zero in gives zero out': there is no zero result to claim anything
+//     about, since get_amount_out(0, ...) traps as V2 reverts with
+//     INSUFFICIENT_INPUT_AMOUNT.
+//   - 'get_amount_in is minimal': false, because whenever Ri*x*D is a
+//     multiple of (Ro-x)*G one unit less already buys x. The claims bound
+//     the overpayment at one unit instead.
+//   - 'Each refusal in the header's table traps': a claim over a call that
+//     traps is false, so every claim assumes its calls do not trap, and no
+//     obligation can say that a call traps. A copy of this file that deletes
+//     a refusal, such as assert(amount_in > 0) in get_amount_out, and so
+//     returns a value where V2 reverts, still satisfies every obligation. No
+//     obligation can check the refusal table; only running the contract can.
+//   - 'Identities on 128-bit values'. A U128 cannot cross a call in a
+//     specification (model.inf says why), so the claims reach wide.inf only
+//     through the 11 methods and model.inf's views. The methods build no
+//     value of 2^80 or more, and the views none of 2^96 or more
+//     (mul_by_limb, a 64-bit value times a u32, comes closest). Within those
+//     bounds, neither the obligations nor the methods take these paths of
+//     wide.inf:
+//       - add's carries out of limb 2 and its overflow trap, and sub's
+//         underflow trap: no value reaches 2^96, and no subtraction goes
+//         below zero;
+//       - add's carry out of limb 1 that an incoming carry causes: the
+//         partial products mul_by adds above limb 0 have a zero low limb,
+//         and every other sum adds two values below 2^48;
+//       - sub's borrows out of limbs 1 and 2, nonzero limb-2 and limb-3
+//         partial products in mul_by, and a failing assert in mul_by or
+//         isqrt: these receive values below 2^64 only;
+//       - lt's branch for an unequal limb 3, and shr32's move of a nonzero
+//         limb 3 into limb 2: limb 3 is always zero, so lt's test of it runs
+//         and always finds the limbs equal;
+//       - nonzero limb-2 and limb-3 results of shl1_or and a failing assert
+//         there: it shifts only division remainders, which stay below their
+//         divisor, and every divisor is below 2^48;
+//       - a difference in limbs 1-3 that eq finds after limb 0 matched:
+//         limbs 2 and 3 are zero in both operands, and eq's one caller,
+//         mul_div_up, compares two values less than 2^32 apart, which are
+//         equal once limb 0 is. When limb 0 matches, all four of eq's tests
+//         run, and they must find equal limbs equal.
+//     A copy of wide.inf that changes behaviour only on these paths still
+//     satisfies every obligation, and the 11 methods still return the same
+//     results; only running that code can check it. Limb-parameter views
+//     like tests/shell's could state claims about these paths, but every
+//     such view would ship in the deployed contract (there is no dead-code
+//     elimination). tests/shell exports every wide operation over explicit
+//     limbs instead, so that a test on the host can reach them.
+spec PairMath {
+    // --- get_amount_out --------------------------------------------------
+
+    // The swap returns on every input the method accepts, and its output
+    // stays below the reserve.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec1.
+    fn get_amount_out_returns_below_reserve() forall {
+        let a: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(a > 0 && ri > 0 && ro > 0 && f < 10000);
+        }
+        // A bare call states on its own that the call returns. The assert
+        // below implies it too, because a claim over a call that traps is
+        // false; a bare call is the form to use when no value is asserted.
+        get_amount_out(a, ri, ro, f);
+        assert(get_amount_out(a, ri, ro, f) < ro);
+    }
+
+    // The output passes the fee-adjusted k check, and one unit more, while
+    // still below the reserve, fails it. With k_holds_with_fee_is_exact's
+    // formula, whose left side never rises and whose right side never falls
+    // as amount_out rises, that makes it the largest output the check
+    // accepts.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec2.
+    fn get_amount_out_is_largest_feasible() forall {
+        let a: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(a > 0 && ri > 0 && ro > 0 && f < 10000);
+        }
+        let o: u32 = get_amount_out(a, ri, ro, f);
+        assert(k_holds_with_fee(a, o, ri, ro, f));
+        if o + 1 < ro {
+            assert(!k_holds_with_fee(a, o + 1, ri, ro, f));
+        }
+    }
+
+    // get_amount_out equals the V2 formula on its whole no-trap domain,
+    // written in split form. With P = a*G (below 2^46) and the reserve split
+    // as Ro = rh * 2^16 + rl, P*Ro = P*rh * 2^16 + P*rl, and
+    // floor(P*Ro / den) = floor(P*rh / den) * 2^16
+    //                     + floor(((P*rh) mod den * 2^16 + P*rl) / den),
+    // where every term stays below 2^63.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec3.
+    fn get_amount_out_is_exact() forall {
+        const D: u64 = 10000;
+        let a: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(a > 0 && ri > 0 && ro > 0 && f < 10000);
+        }
+        let p: u64 = widen(a) * widen(10000 - f);
+        let den: u64 = widen(ri) * D + p;
+        let rh: u64 = widen(ro) >> 16;
+        let rl: u64 = widen(ro) & 65535;
+        let ph: u64 = p * rh;
+        let pl: u64 = p * rl;
+        let expected: u64 = (ph / den) * 65536 + ((ph % den) * 65536 + pl) / den;
+        assert(widen(get_amount_out(a, ri, ro, f)) == expected);
+    }
+
+    // The V2 formula as V2's source writes it, evaluated in u64, wherever
+    // its numerator a*G*Ro fits u64; a*G <= floor((2^64 - 1) / Ro) is
+    // exactly that condition.
+    // Scope: the envelope a*G*Ro <= 2^64 - 1. Rocq: main__PairMath_hspec4.
+    fn get_amount_out_matches_v2_formula() forall {
+        const D: u64 = 10000;
+        const U64_MAX: u64 = 18446744073709551615;
+        let a: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(a > 0 && ri > 0 && ro > 0 && f < 10000);
+        }
+        let g: u64 = widen(10000 - f);
+        assume {
+            assert(widen(a) * g <= U64_MAX / widen(ro));
+        }
+        let expected: u64 = (widen(a) * g * widen(ro)) / (widen(ri) * D + widen(a) * g);
+        assert(widen(get_amount_out(a, ri, ro, f)) == expected);
+    }
+
+    // Paying more never buys less.
+    // Scope: the exact no-trap domain, with a1 <= a2.
+    // Rocq: main__PairMath_hspec5.
+    fn get_amount_out_never_falls_as_amount_in_rises() forall {
+        let a1: u32 = @;
+        let a2: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(a1 > 0 && a1 <= a2 && ri > 0 && ro > 0 && f < 10000);
+        }
+        assert(get_amount_out(a1, ri, ro, f) <= get_amount_out(a2, ri, ro, f));
+    }
+
+    // A higher fee never buys more.
+    // Scope: the exact no-trap domain, with f1 <= f2.
+    // Rocq: main__PairMath_hspec6.
+    fn get_amount_out_never_rises_with_fee() forall {
+        let a: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f1: u32 = @;
+        let f2: u32 = @;
+        assume {
+            assert(a > 0 && ri > 0 && ro > 0 && f1 <= f2 && f2 < 10000);
+        }
+        assert(get_amount_out(a, ri, ro, f2) <= get_amount_out(a, ri, ro, f1));
+    }
+
+    // --- get_amount_in ---------------------------------------------------
+    //
+    // With n = Ri*x (below 2^64) and q = (Ro-x)*G, get_amount_in returns
+    // floor(n*D / q) + 1 and returns at all exactly when floor(n*D / q) is
+    // at most MAX_Q = 2^32 - 2, the largest quotient whose +1 still fits a
+    // u32. Writing n = u*q + v, floor(n*D / q) = u*D + floor(v*D / q), so its
+    // exact no-trap domain in u64 terms is
+    //   u <= MAX_U  and  floor_nd_q = u*D + floor(v*D / q) <= MAX_Q,
+    // where MAX_U = 429496 = floor((2^32 - 1) / D). u*D wraps only where
+    // u > MAX_U, where the first conjunct is already false, so the second
+    // decides the assumption only where it cannot wrap.
+    //
+    // The three claims below restate the same constants and assumptions. A
+    // const cannot be top-level (A032), and an assertion cannot call a
+    // spec-local helper (Inferara/inference#390). A module-level function
+    // could hold a constant, as minimum_liquidity() holds 1000, or the whole
+    // assumption. But it would ship in the deployed contract, and the claim
+    // would then rest on its executable arithmetic, which is checked by
+    // default. Unless every operator were wrapped, an overflow would make
+    // the call trap, and an assumption whose call traps filters nothing (see
+    // Reading a spec): the claim would still have to hold on that input, and
+    // would be false wherever get_amount_in traps there too. Spelled out in
+    // place, each assumption stays in wrapping u64 terms and reads where it
+    // is used.
+
+    // Paying get_amount_in buys at least the target, and the swap keeps k.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec7.
+    fn get_amount_in_buys_the_target() forall {
+        const D: u64 = 10000;
+        const MAX_U: u64 = 429496;
+        const MAX_Q: u64 = 4294967294;
+        let x: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(x > 0 && ri > 0 && ro > 0 && x < ro && f < 10000);
+        }
+        let n: u64 = widen(ri) * widen(x);
+        let q: u64 = widen(ro - x) * widen(10000 - f);
+        let u: u64 = n / q;
+        let v: u64 = n % q;
+        let floor_nd_q: u64 = u * D + (v * D) / q;
+        assume {
+            assert(u <= MAX_U && floor_nd_q <= MAX_Q);
+        }
+        let i: u32 = get_amount_in(x, ri, ro, f);
+        assert(get_amount_out(i, ri, ro, f) >= x);
+        assert(k_holds_with_fee(i, x, ri, ro, f));
+    }
+
+    // It overpays by at most one unit: two units less no longer buy x, and
+    // by get_amount_out_never_falls_as_amount_in_rises no smaller input does
+    // either.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec8.
+    fn get_amount_in_overpays_by_at_most_one() forall {
+        const D: u64 = 10000;
+        const MAX_U: u64 = 429496;
+        const MAX_Q: u64 = 4294967294;
+        let x: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(x > 0 && ri > 0 && ro > 0 && x < ro && f < 10000);
+        }
+        let n: u64 = widen(ri) * widen(x);
+        let q: u64 = widen(ro - x) * widen(10000 - f);
+        let u: u64 = n / q;
+        let v: u64 = n % q;
+        let floor_nd_q: u64 = u * D + (v * D) / q;
+        assume {
+            assert(u <= MAX_U && floor_nd_q <= MAX_Q);
+        }
+        let i: u32 = get_amount_in(x, ri, ro, f);
+        if i > 2 {
+            assert(get_amount_out(i - 2, ri, ro, f) < x);
+        }
+    }
+
+    // The exact value, floor(n*D / q) + 1, with floor(n*D / q) in the split
+    // form above (floor_nd_q).
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec9.
+    fn get_amount_in_is_exact() forall {
+        const D: u64 = 10000;
+        const MAX_U: u64 = 429496;
+        const MAX_Q: u64 = 4294967294;
+        let x: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(x > 0 && ri > 0 && ro > 0 && x < ro && f < 10000);
+        }
+        let n: u64 = widen(ri) * widen(x);
+        let q: u64 = widen(ro - x) * widen(10000 - f);
+        let u: u64 = n / q;
+        let v: u64 = n % q;
+        let floor_nd_q: u64 = u * D + (v * D) / q;
+        assume {
+            assert(u <= MAX_U && floor_nd_q <= MAX_Q);
+        }
+        let expected: u64 = floor_nd_q + 1;
+        assert(widen(get_amount_in(x, ri, ro, f)) == expected);
+    }
+
+    // The V2 formula as V2's source writes it, evaluated in u64, wherever its
+    // numerator Ri*x*D fits u64 and the result fits u32.
+    // Scope: the envelope Ri*x <= floor((2^64 - 1) / D).
+    // Rocq: main__PairMath_hspec10.
+    fn get_amount_in_matches_v2_formula() forall {
+        const D: u64 = 10000;
+        const U64_MAX_OVER_D: u64 = 1844674407370955;
+        const MAX_Q: u64 = 4294967294;
+        let x: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(x > 0 && ri > 0 && ro > 0 && x < ro && f < 10000);
+        }
+        assume {
+            assert(widen(ri) * widen(x) <= U64_MAX_OVER_D);
+        }
+        let num: u64 = widen(ri) * widen(x) * D;
+        let q: u64 = widen(ro - x) * widen(10000 - f);
+        assume {
+            assert(num / q <= MAX_Q);
+        }
+        assert(widen(get_amount_in(x, ri, ro, f)) == num / q + 1);
+    }
+
+    // --- quote, mint and burn --------------------------------------------
+
+    // quote is exactly floor(a*Rb / Ra).
+    // Scope: the exact no-trap domain; the second assumption is the u32 fit.
+    // Rocq: main__PairMath_hspec11.
+    fn quote_is_exact() forall {
+        let a: u32 = @;
+        let ra: u32 = @;
+        let rb: u32 = @;
+        assume {
+            assert(a > 0 && ra > 0 && rb > 0);
+        }
+        assume {
+            assert(widen(a) * widen(rb) < (widen(ra) << 32));
+        }
+        assert(widen(quote(a, ra, rb)) == (widen(a) * widen(rb)) / widen(ra));
+    }
+
+    // root = result + minimum_liquidity() is the floor square root of a0*a1:
+    // root*root <= a0*a1 < (root + 1)^2.
+    // Scope: the exact no-trap domain (a0*a1 >= 1001^2).
+    // Rocq: main__PairMath_hspec12.
+    fn mint_initial_is_floor_sqrt_minus_minimum() forall {
+        const MIN_PRODUCT: u64 = 1002001;
+        let a0: u32 = @;
+        let a1: u32 = @;
+        assume {
+            assert(widen(a0) * widen(a1) >= MIN_PRODUCT);
+        }
+        let n: u64 = widen(a0) * widen(a1);
+        let root: u64 = widen(mint_initial(a0, a1)) + widen(minimum_liquidity());
+        assert(root * root <= n && n - root * root <= 2 * root);
+    }
+
+    // Equal amounts x mint x - minimum_liquidity(): the square root of x*x
+    // is exact.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec13.
+    fn mint_initial_is_exact_on_equal_amounts() forall {
+        let x: u32 = @;
+        assume {
+            assert(x > 1000);
+        }
+        assert(mint_initial(x, x) == x - minimum_liquidity());
+    }
+
+    // Both shares, share0 = floor(a0*S / R0) and share1 = floor(a1*S / R1),
+    // fit and are positive: the result is their minimum.
+    // Scope: the part of the exact no-trap domain where both shares fit; the
+    // next spec function covers the rest. Rocq: main__PairMath_hspec14.
+    fn mint_proportional_is_min_share() forall {
+        let a0: u32 = @;
+        let a1: u32 = @;
+        let r0: u32 = @;
+        let r1: u32 = @;
+        let s: u32 = @;
+        assume {
+            assert(r0 > 0 && r1 > 0 && s > 0);
+        }
+        let n0: u64 = widen(a0) * widen(s);
+        let n1: u64 = widen(a1) * widen(s);
+        let share0: u64 = n0 / widen(r0);
+        let share1: u64 = n1 / widen(r1);
+        assume {
+            assert(n0 < (widen(r0) << 32) && n1 < (widen(r1) << 32));
+        }
+        assume {
+            assert(n0 >= widen(r0) && n1 >= widen(r1));
+        }
+        let liquidity: u64 = widen(mint_proportional(a0, a1, r0, r1, s));
+        assert(liquidity <= share0 && liquidity <= share1);
+        assert(liquidity == share0 || liquidity == share1);
+    }
+
+    // Exactly one share fits: the result is that share, the smaller one.
+    // Scope: the part of the exact no-trap domain where exactly one share
+    // fits; mint_proportional_is_min_share covers the rest. The share that
+    // does not fit is then at least 2^32, so its n >= R assumption holds
+    // anyway. Rocq: main__PairMath_hspec15.
+    fn mint_proportional_one_share_fits() forall {
+        let a0: u32 = @;
+        let a1: u32 = @;
+        let r0: u32 = @;
+        let r1: u32 = @;
+        let s: u32 = @;
+        assume {
+            assert(r0 > 0 && r1 > 0 && s > 0);
+        }
+        let n0: u64 = widen(a0) * widen(s);
+        let n1: u64 = widen(a1) * widen(s);
+        let share0: u64 = n0 / widen(r0);
+        let share1: u64 = n1 / widen(r1);
+        let fits0: bool = n0 < (widen(r0) << 32);
+        let fits1: bool = n1 < (widen(r1) << 32);
+        assume {
+            assert(fits0 != fits1);
+        }
+        assume {
+            assert(n0 >= widen(r0) && n1 >= widen(r1));
+        }
+        let liquidity: u64 = widen(mint_proportional(a0, a1, r0, r1, s));
+        if fits0 {
+            assert(liquidity == share0);
+        } else {
+            assert(liquidity == share1);
+        }
+    }
+
+    // The burned amount is exactly the floored pro-rata share, and it never
+    // exceeds the balance.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec16.
+    fn burn_share_is_exact() forall {
+        let liquidity: u32 = @;
+        let b: u32 = @;
+        let s: u32 = @;
+        assume {
+            assert(s > 0 && liquidity <= s && widen(liquidity) * widen(b) >= widen(s));
+        }
+        let out: u32 = burn_share(liquidity, b, s);
+        assert(widen(out) == (widen(liquidity) * widen(b)) / widen(s));
+        assert(out <= b);
+    }
+
+    // Burning the whole supply returns the whole balance.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec17.
+    fn burn_share_of_whole_supply_is_balance() forall {
+        let b: u32 = @;
+        let s: u32 = @;
+        assume {
+            assert(s > 0 && b > 0);
+        }
+        assert(burn_share(s, b, s) == b);
+    }
+
+    // --- the k check -----------------------------------------------------
+
+    // (Ri+a)*(Ro-o) >= Ri*Ro rearranges to a*(Ro-o) >= Ri*o, whose two sides
+    // are products of two u32 values, so k_holds decides it exactly.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec18.
+    fn k_holds_is_exact() forall {
+        let a: u32 = @;
+        let o: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        assume {
+            assert(ri > 0 && o < ro);
+        }
+        assert(k_holds(a, o, ri, ro) == (widen(a) * widen(ro - o) >= widen(ri) * widen(o)));
+    }
+
+    // k_holds_with_fee decides the fee-adjusted k inequality exactly, on
+    // every input it accepts. The check rearranges to lhs*G >= rhs*D with
+    // lhs = a*(Ro-o) and rhs = Ri*o, and lhs*G >= rhs*D holds exactly when
+    // floor(lhs*G / D) >= rhs. Writing lhs = u*D + v,
+    // floor_lhs_g_d = floor(lhs*G / D) = u*G + floor(v*G / D), which never
+    // exceeds lhs < 2^64, so the formula cannot wrap.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec19.
+    fn k_holds_with_fee_is_exact() forall {
+        const D: u64 = 10000;
+        let a: u32 = @;
+        let o: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(f < 10000 && ri > 0 && o < ro);
+        }
+        let lhs: u64 = widen(a) * widen(ro - o);
+        let rhs: u64 = widen(ri) * widen(o);
+        let g: u64 = widen(10000 - f);
+        let u: u64 = lhs / D;
+        let v: u64 = lhs % D;
+        let floor_lhs_g_d: u64 = u * g + (v * g) / D;
+        assert(k_holds_with_fee(a, o, ri, ro, f) == (floor_lhs_g_d >= rhs));
+    }
+
+    // The check in V2's form, with one factor of D cancelled, evaluated in
+    // u64 wherever both sides fit.
+    // Scope: the envelope adj*(Ro-o) <= 2^64 - 1 and
+    // Ri*Ro <= floor((2^64 - 1) / D). Rocq: main__PairMath_hspec20.
+    fn k_holds_with_fee_matches_v2_formula() forall {
+        const D: u64 = 10000;
+        const U64_MAX: u64 = 18446744073709551615;
+        const U64_MAX_OVER_D: u64 = 1844674407370955;
+        let a: u32 = @;
+        let o: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(f < 10000 && ri > 0 && o < ro);
+        }
+        let adj: u64 = (widen(ri) + widen(a)) * D - widen(a) * widen(f);
+        assume {
+            assert(adj <= U64_MAX / widen(ro - o) && widen(ri) * widen(ro) <= U64_MAX_OVER_D);
+        }
+        assert(k_holds_with_fee(a, o, ri, ro, f) == (adj * widen(ro - o) >= widen(ri) * widen(ro) * D));
+    }
+
+    // A quoted swap passes the fee-free check and the fee check at the fee it
+    // was quoted at.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec21.
+    fn get_amount_out_passes_both_k_checks() forall {
+        let a: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(a > 0 && ri > 0 && ro > 0 && f < 10000);
+        }
+        let o: u32 = get_amount_out(a, ri, ro, f);
+        assert(k_holds(a, o, ri, ro));
+        assert(k_holds_with_fee(a, o, ri, ro, f));
+    }
+
+    // Taking output without paying input fails both checks.
+    // Scope: the part of the exact no-trap domain with a positive output (a
+    // zero output passes both checks, as k_holds_is_exact and
+    // k_holds_with_fee_is_exact state). Rocq: main__PairMath_hspec22.
+    fn k_checks_refuse_unpaid_withdrawal() forall {
+        let o: u32 = @;
+        let ri: u32 = @;
+        let ro: u32 = @;
+        let f: u32 = @;
+        assume {
+            assert(ri > 0 && o > 0 && o < ro && f < 10000);
+        }
+        assert(!k_holds(0, o, ri, ro));
+        assert(!k_holds_with_fee(0, o, ri, ro, f));
+    }
+
+    // --- mul_div ---------------------------------------------------------
+
+    // The floor fits exactly when a*b < d * 2^32.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec23.
+    fn mul_div_is_floor() forall {
+        let a: u32 = @;
+        let b: u32 = @;
+        let d: u32 = @;
+        assume {
+            assert(d > 0 && widen(a) * widen(b) < (widen(d) << 32));
+        }
+        assert(widen(mul_div(a, b, d)) == (widen(a) * widen(b)) / widen(d));
+    }
+
+    // The ceiling fits exactly when a*b + d - 1 < d * 2^32. The floor
+    // fitting is not enough: at a*b = d*(2^32 - 1) + r with 0 < r < d the
+    // floor fits and mul_div_up traps.
+    // Scope: the exact no-trap domain. Rocq: main__PairMath_hspec24.
+    fn mul_div_up_is_ceiling() forall {
+        let a: u32 = @;
+        let b: u32 = @;
+        let d: u32 = @;
+        assume {
+            assert(d > 0 && widen(a) * widen(b) + widen(d) - 1 < (widen(d) << 32));
+        }
+        assert(widen(mul_div_up(a, b, d)) == (widen(a) * widen(b) + widen(d) - 1) / widen(d));
+    }
+
+    // --- reference vectors -----------------------------------------------
+
+    // Values Uniswap V2 itself produces at its 0.3% fee (fee_bps = 30), and
+    // the full-width corner of mul_div.
+    // Scope: fixed values. Rocq: main__PairMath_hspec25.
+    fn v2_reference_vectors() forall {
+        assert(minimum_liquidity() == 1000);
+        assert(get_amount_out(1000, 100000, 100000, 30) == 987);
+        assert(get_amount_in(987, 100000, 100000, 30) == 1000);
+        assert(get_amount_out(1, 1000000, 1000, 30) == 0);
+        assert(mint_initial(1000000, 4000000) == 1999000);
+        assert(quote(100, 1000, 3000) == 300);
+        assert(mul_div(4294967295, 4294967295, 4294967295) == 4294967295);
+        assert(mul_div_up(4294967295, 4294967295, 4294967295) == 4294967295);
+    }
+}
