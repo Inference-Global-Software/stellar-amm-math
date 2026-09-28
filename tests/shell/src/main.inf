@@ -1,0 +1,160 @@
+// Test shell: scalar views of every operation in wide.inf and model.inf.
+//
+// This project is never deployed. Its src/wide.inf and src/model.inf are
+// byte-identical copies of the contract's, and this file exports each of
+// their functions over explicit u32 limbs, so a test on the host can call
+// them with any operand up to 2^128 - 1 and compare the result with exact
+// integer arithmetic, traps included. The copies keep the contract and this
+// shell each an ordinary, warning-free infs project. The views also build
+// with infc from the contract's own src/, but every infs build of the
+// contract then warns about the file its entry point does not import. After
+// editing either file in the contract's src/, copy it here; from the
+// repository root, both
+//   cmp src/wide.inf tests/shell/src/wide.inf
+//   cmp src/model.inf tests/shell/src/model.inf
+// must succeed, or a test of this shell checks stale code.
+//
+// It exists because the contract alone cannot exercise all of that code.
+// The 11 contract methods take u32 arguments and build no value of 2^80 or
+// more, and model.inf's views build none of 2^96 or more, so many paths of
+// wide.inf are taken by no method and reached by no obligation: every path
+// that needs a nonzero limb 3, add's carries beyond limb 1, sub's borrows
+// beyond limb 0, a failing assert in mul_by, shl1_or or isqrt, and more.
+// The comment above spec PairMath in the contract's src/main.inf lists them
+// all and says why each is unreached. A copy of wide.inf that changes
+// behaviour only on those paths leaves every result of the 11 methods
+// unchanged and still satisfies every obligation. The specification bridge
+// in model.inf is not exported by the contract either, yet the WideArith
+// and PairMath obligations read it, so its functions need a numeric check
+// of their own.
+//
+// A U128 crosses a wasm32 export only as the address of its four limbs in
+// linear memory, and a U128 result through a hidden first pointer parameter.
+// Driving that would tie a harness to the compiler's layout and its
+// stack-pointer handling, so each w_ view takes the limbs of its U128
+// operands as separate u32 parameters, least significant first (a0 is w0),
+// and returns one u32 or bool. Views of a U128-valued operation take a limb
+// index k and return limb k of the result (k >= 3 selects limb 3); a
+// harness calls them once per limb. The m_ views keep model.inf's own
+// signatures, which write a 64-bit operand high limb first:
+// m_div64(hi, lo, d) divides hi * 2^32 + lo by d, and m_widen returns a
+// u64. Each view is named after the function it drives: w_ for wide.inf,
+// m_ for model.inf.
+
+use wide::{U128, from_u32, mul32, add, sub, mul_by, eq, lt, le, shr32, shl1_or, quotient_fits, div_to_u32, isqrt};
+use model::{widen, mul_lo, mul_hi, mul_by_limb, div64, sqrt64};
+
+// Limb k of r: 0, 1 or 2, and limb 3 for any other k.
+fn pick(r: U128, k: u32) -> u32 {
+    if k == 0 {
+        return r.w0;
+    }
+    if k == 1 {
+        return r.w1;
+    }
+    if k == 2 {
+        return r.w2;
+    }
+    return r.w3;
+}
+
+pub fn w_from_u32(x: u32, k: u32) -> u32 {
+    let r: U128 = from_u32(x);
+    return pick(r, k);
+}
+
+pub fn w_mul32(a: u32, b: u32, k: u32) -> u32 {
+    let r: U128 = mul32(a, b);
+    return pick(r, k);
+}
+
+pub fn w_add(a0: u32, a1: u32, a2: u32, a3: u32, b0: u32, b1: u32, b2: u32, b3: u32, k: u32) -> u32 {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let b: U128 = U128 { w0: b0, w1: b1, w2: b2, w3: b3 };
+    let r: U128 = add(a, b);
+    return pick(r, k);
+}
+
+pub fn w_sub(a0: u32, a1: u32, a2: u32, a3: u32, b0: u32, b1: u32, b2: u32, b3: u32, k: u32) -> u32 {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let b: U128 = U128 { w0: b0, w1: b1, w2: b2, w3: b3 };
+    let r: U128 = sub(a, b);
+    return pick(r, k);
+}
+
+pub fn w_mul_by(a0: u32, a1: u32, a2: u32, a3: u32, m: u32, k: u32) -> u32 {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let r: U128 = mul_by(a, m);
+    return pick(r, k);
+}
+
+pub fn w_eq(a0: u32, a1: u32, a2: u32, a3: u32, b0: u32, b1: u32, b2: u32, b3: u32) -> bool {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let b: U128 = U128 { w0: b0, w1: b1, w2: b2, w3: b3 };
+    return eq(a, b);
+}
+
+pub fn w_lt(a0: u32, a1: u32, a2: u32, a3: u32, b0: u32, b1: u32, b2: u32, b3: u32) -> bool {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let b: U128 = U128 { w0: b0, w1: b1, w2: b2, w3: b3 };
+    return lt(a, b);
+}
+
+pub fn w_le(a0: u32, a1: u32, a2: u32, a3: u32, b0: u32, b1: u32, b2: u32, b3: u32) -> bool {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let b: U128 = U128 { w0: b0, w1: b1, w2: b2, w3: b3 };
+    return le(a, b);
+}
+
+pub fn w_shr32(a0: u32, a1: u32, a2: u32, a3: u32, k: u32) -> u32 {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let r: U128 = shr32(a);
+    return pick(r, k);
+}
+
+pub fn w_shl1_or(a0: u32, a1: u32, a2: u32, a3: u32, bit: u32, k: u32) -> u32 {
+    let a: U128 = U128 { w0: a0, w1: a1, w2: a2, w3: a3 };
+    let r: U128 = shl1_or(a, bit);
+    return pick(r, k);
+}
+
+pub fn w_quotient_fits(n0: u32, n1: u32, n2: u32, n3: u32, d0: u32, d1: u32, d2: u32, d3: u32) -> bool {
+    let n: U128 = U128 { w0: n0, w1: n1, w2: n2, w3: n3 };
+    let d: U128 = U128 { w0: d0, w1: d1, w2: d2, w3: d3 };
+    return quotient_fits(n, d);
+}
+
+pub fn w_div_to_u32(n0: u32, n1: u32, n2: u32, n3: u32, d0: u32, d1: u32, d2: u32, d3: u32) -> u32 {
+    let n: U128 = U128 { w0: n0, w1: n1, w2: n2, w3: n3 };
+    let d: U128 = U128 { w0: d0, w1: d1, w2: d2, w3: d3 };
+    return div_to_u32(n, d);
+}
+
+pub fn w_isqrt(n0: u32, n1: u32, n2: u32, n3: u32) -> u32 {
+    let n: U128 = U128 { w0: n0, w1: n1, w2: n2, w3: n3 };
+    return isqrt(n);
+}
+
+pub fn m_widen(x: u32) -> u64 {
+    return widen(x);
+}
+
+pub fn m_mul_lo(a: u32, b: u32) -> u32 {
+    return mul_lo(a, b);
+}
+
+pub fn m_mul_hi(a: u32, b: u32) -> u32 {
+    return mul_hi(a, b);
+}
+
+pub fn m_mul_by_limb(hi: u32, lo: u32, m: u32, k: u32) -> u32 {
+    return mul_by_limb(hi, lo, m, k);
+}
+
+pub fn m_div64(hi: u32, lo: u32, d: u32) -> u32 {
+    return div64(hi, lo, d);
+}
+
+pub fn m_sqrt64(hi: u32, lo: u32) -> u32 {
+    return sqrt64(hi, lo);
+}

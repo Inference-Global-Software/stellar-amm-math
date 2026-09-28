@@ -1,0 +1,183 @@
+// The specification bridge: u64 views of the limb arithmetic, and the
+// WideArith obligations that pin them.
+//
+// A U128 cannot cross a call in a specification. A term in an obligation is
+// a single scalar, so an aggregate cannot be a call argument in a spec
+// (P004) and a compound-returning call cannot be a spec term (P005). The
+// functions below return scalars: widen(x) is x as a u64; mul_lo, mul_hi and
+// mul_by_limb expose one u32 limb of a wide result, and div64 and sqrt64
+// take a 64-bit operand as two u32 limbs and return its u32 quotient or
+// root. With them, PairMath and WideArith can state claims about wide
+// products and quotients in u64 terms. An obligation's arithmetic is the
+// wrapping machine operator, and u64 is its widest type, so a claim either
+// keeps its u64 terms below 2^64 (a product of two widened u32 values always
+// is) or, like the low half of the mul_by claim below, means the wrap.
+//
+// Nothing in the contract's 11 methods calls these functions, yet they ship
+// inside the deployed contract: the compiler runs no dead-code elimination,
+// and the module that is proven and the module that is deployed must come
+// from one entry file, so the bridge is compiled into both. It costs about
+// 830 bytes of the 9.4 KB contract.
+//
+// widen is the trust bridge the other obligations rest on. The language has
+// no numeric conversions, so widen rebuilds x bit by bit in a loop, and every
+// claim that compares a widened value with a u64 expression reads it as the
+// identity. WideArith therefore pins it first: widen(0) = 0 and
+// widen(x + 1) = widen(x) + 1 below the top of u32, which together give the
+// identity by induction. The range bound widen(x) <= 2^32 - 1 follows from
+// them and is stated as well, so that a proof can use it without redoing the
+// induction.
+
+use wide::{U128, mul32, mul_by, div_to_u32, isqrt, from_u32};
+
+// x as a u64. Never traps.
+pub fn widen(x: u32) -> u64 {
+    let mut r: u64 = 0;
+    let mut bit: u64 = 1;
+    let mut i: u32 = 0;
+    loop i < 32 {
+        if ((x >> i) & 1) == 1 {
+            r = r | bit;
+        }
+        bit = bit << 1;
+        i = i + 1;
+    }
+    return r;
+}
+
+// The low 32 bits of a * b. Never traps.
+pub fn mul_lo(a: u32, b: u32) -> u32 {
+    let p: U128 = mul32(a, b);
+    return p.w0;
+}
+
+// The high 32 bits of a * b. Never traps.
+pub fn mul_hi(a: u32, b: u32) -> u32 {
+    let p: U128 = mul32(a, b);
+    return p.w1;
+}
+
+// Limb k of (hi * 2^32 + lo) * m: limb 0, 1 or 2 for k = 0, 1 or 2, and
+// limb 3 for any other k. Never traps, since the product is below 2^96.
+pub fn mul_by_limb(hi: u32, lo: u32, m: u32, k: u32) -> u32 {
+    let n: U128 = U128 { w0: lo, w1: hi, w2: 0, w3: 0 };
+    let p: U128 = mul_by(n, m);
+    if k == 0 {
+        return p.w0;
+    }
+    if k == 1 {
+        return p.w1;
+    }
+    if k == 2 {
+        return p.w2;
+    }
+    return p.w3;
+}
+
+// floor((hi * 2^32 + lo) / d). Traps unless hi < d (which also rules out
+// d = 0): that is exactly when the quotient fits a u32.
+pub fn div64(hi: u32, lo: u32, d: u32) -> u32 {
+    let n: U128 = U128 { w0: lo, w1: hi, w2: 0, w3: 0 };
+    let dd: U128 = from_u32(d);
+    return div_to_u32(n, dd);
+}
+
+// floor(sqrt(hi * 2^32 + lo)). Never traps.
+pub fn sqrt64(hi: u32, lo: u32) -> u32 {
+    let n: U128 = U128 { w0: lo, w1: hi, w2: 0, w3: 0 };
+    return isqrt(n);
+}
+
+// Obligations over the bridge. Each limb claim is two-sided: it pins its
+// function's value exactly on the claim's domain (64-bit operands, where the
+// call does not trap), so an off-by-one in a value there falsifies it. No
+// claim says where a function traps. The bridge drives wide.inf with 64-bit
+// operands only, so many of wide.inf's paths (every one that needs a limb-3
+// value, and others; main.inf lists them all) are reached by no claim. Only
+// running the code can check those paths and the traps; tests/shell exports
+// every function of this file and of wide.inf so that a test on the host
+// can. Each comment below gives its claim's scope, in the terms main.inf
+// defines above spec PairMath, and its Rocq definition,
+// main__model_WideArith_hspecN for the Nth spec function of this block.
+spec WideArith {
+    // The base case of the induction the header describes.
+    // Scope: fixed values. Rocq: main__model_WideArith_hspec1.
+    fn widen_is_zero_at_zero() forall {
+        assert(widen(0) == 0);
+    }
+
+    // The successor step, below the top of u32.
+    // Scope: the exact no-trap domain (every input), with x < 2^32 - 1.
+    // Rocq: main__model_WideArith_hspec2.
+    fn widen_is_one_more_at_x_plus_one() forall {
+        let x: u32 = @;
+        assume {
+            assert(x < 4294967295);
+        }
+        assert(widen(x + 1) == widen(x) + 1);
+    }
+
+    // The range bound, a corollary of the two above.
+    // Scope: the exact no-trap domain (every input).
+    // Rocq: main__model_WideArith_hspec3.
+    fn widen_is_at_most_u32_max() forall {
+        let x: u32 = @;
+        assert(widen(x) <= 4294967295);
+    }
+
+    // mul32 is the exact 64-bit product.
+    // Scope: the exact no-trap domain (every input).
+    // Rocq: main__model_WideArith_hspec4.
+    fn mul32_is_exact() forall {
+        let a: u32 = @;
+        let b: u32 = @;
+        assert(((widen(mul_hi(a, b)) << 32) | widen(mul_lo(a, b))) == widen(a) * widen(b));
+    }
+
+    // mul_by on a 64-bit value n: limbs 0-1 are n * m mod 2^64, limb 2 is
+    // floor(n * m / 2^64), and limb 3 is zero. The limb-2 term regroups
+    // n * m = hi * m * 2^32 + lo * m, and every partial sum in it is below
+    // 2^64.
+    // Scope: the exact no-trap domain (every input).
+    // Rocq: main__model_WideArith_hspec5.
+    fn mul_by_is_exact_on_64_bits() forall {
+        let hi: u32 = @;
+        let lo: u32 = @;
+        let m: u32 = @;
+        let n: u64 = (widen(hi) << 32) | widen(lo);
+        let l0: u64 = widen(mul_by_limb(hi, lo, m, 0));
+        let l1: u64 = widen(mul_by_limb(hi, lo, m, 1));
+        let l2: u64 = widen(mul_by_limb(hi, lo, m, 2));
+        assert(((l1 << 32) | l0) == n * widen(m));
+        assert(l2 == (widen(hi) * widen(m) + ((widen(lo) * widen(m)) >> 32)) >> 32);
+        assert(mul_by_limb(hi, lo, m, 3) == 0);
+    }
+
+    // div_to_u32 on a 64-bit numerator and a u32 divisor is floor division
+    // wherever the quotient fits: q * d <= n < (q + 1) * d.
+    // Scope: the exact no-trap domain (hi < d, which implies d > 0).
+    // Rocq: main__model_WideArith_hspec6.
+    fn div64_is_floor() forall {
+        let hi: u32 = @;
+        let lo: u32 = @;
+        let d: u32 = @;
+        assume {
+            assert(hi < d);
+        }
+        let n: u64 = (widen(hi) << 32) | widen(lo);
+        let qd: u64 = widen(div64(hi, lo, d)) * widen(d);
+        assert(qd <= n && n - qd < widen(d));
+    }
+
+    // isqrt is the floor square root on all of u64: s * s <= n < (s + 1)^2,
+    // written n - s * s <= 2 * s so that no term reaches 2^64.
+    // Scope: the exact no-trap domain (every input).
+    // Rocq: main__model_WideArith_hspec7.
+    fn sqrt64_is_floor() forall {
+        let hi: u32 = @;
+        let lo: u32 = @;
+        let n: u64 = (widen(hi) << 32) | widen(lo);
+        let s: u64 = widen(sqrt64(hi, lo));
+        assert(s * s <= n && n - s * s <= 2 * s);
+    }
+}
