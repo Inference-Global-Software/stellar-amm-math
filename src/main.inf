@@ -1,16 +1,14 @@
 // Uniswap V2 constant-product AMM math, compiled to a Stellar (Soroban)
 // smart contract.
 //
-// Start here. `infs build` writes out/main.wasm, the deployable contract;
-// deploy it with `stellar contract deploy --wasm out/main.wasm ...`, and
+// Start here. README.md is the guide to this repository. `infs build`
+// writes out/main.wasm, the deployable contract; once it is deployed,
 //   stellar contract invoke ... -- get_amount_out --amount_in 1000 \
 //     --reserve_in 100000 --reserve_out 100000 --fee_bps 30
-// returns 987. `infs install` provides infc, which builds the proof
-// obligations (see Specifications) into any directory but out/, where its
-// main.wasm would replace the contract:
-//   infc src/main.inf --target wasm32 -v --out-dir proof
+// returns 987. docs/integration.md explains how a pool calls these methods,
+// and proofs/generate.sh builds the proof obligations (see Specifications).
 // Below, in order: What this contract is, Why every amount is a u32,
-// Formulas, Not provided, Refusals, Specifications.
+// Formulas, Refusals, Specifications.
 //
 // What this contract is. It is the pricing core a stateful pool delegates
 // to: swap quotes, liquidity minting and burning, and the constant-product
@@ -73,62 +71,13 @@
 // +1 is V2's round-up, which is one unit more than needed whenever the
 // division is exact.
 //
-// k_holds_with_fee is V2's 'UniswapV2: K' check,
-// balance0Adjusted * balance1Adjusted >= reserve0 * reserve1 * 1000^2, for a
-// swap with its input on one side and its output on the other, at D = 10000
-// in place of 1000 and with one factor of D cancelled from both sides;
-// k_holds is the same check at fee 0. V2 reads both sides from the pool's
-// balances after the transfers, so both amounts here are balance changes:
-// amount_in is V2's amountIn, the input side's balance minus its stored
-// reserve, and amount_out is the output side's stored reserve minus its
-// balance. That equals V2's amount1Out only when the transfer out takes
-// exactly amount1Out from the pool and nothing pays into the output side
-// during the swap. When the output side's balance ends above
-// reserve_out - amount1Out (V2's amount1In > 0: a flash swap repaid, even
-// partly, in the borrowed token, a positive rebase, a transfer in during the
-// callback), V2 charges the fee on that inflow and neither argument
-// reproduces its check: reserve - balance returns true where V2 reverts with
-// K, and the requested amount can return false where V2 succeeds. The pool
-// must refuse such a swap: test balance_out > reserve_out - amount1Out
-// before calling the check. A pool that passes the requested amount instead,
-// with a token that takes more from the pool than it delivers (a
-// sender-charged fee, a rebase during the swap), gets true where V2 reverts
-// with 'UniswapV2: K'.
-//
-// The 1000 units mint_initial withholds are the MINIMUM_LIQUIDITY that V2
-// mints to address(0) and locks for good; minimum_liquidity() returns it.
-// V2's totalSupply counts them, so after the first deposit the pool records
-// total_supply = mint_initial(...) + minimum_liquidity(), and that is the
-// supply mint_proportional and burn_share must receive. A pool that records
-// mint_initial(...) alone lets the first provider burn the whole pool. B in
-// burn_share is the pool's current balance of the token, as V2's burn uses
-// (balance0 and balance1, not the stored reserves), so a transfer the pool
-// has not yet synced is paid out pro rata too; mint_proportional, like V2's
-// mint, divides by the stored reserves.
-//
-// Not provided. Three parts of V2's pair have no method here; a pool built
-// on this contract implements or refuses them itself.
-//   - The protocol fee (_mintFee). With it switched on, V2's mint and burn
-//     first mint floor(S*(rootK - rootKLast) / (5*rootK + rootKLast)) to
-//     feeTo when kLast != 0 and rootK > rootKLast, where rootK =
-//     floor(sqrt(R0*R1)), rootKLast = floor(sqrt(kLast)), and kLast is R0*R1
-//     after the last mint or burn made while the fee was on. V2 records
-//     kLast only then, and resets it to 0 at the first mint or burn after the
-//     fee is switched off. The mint or burn then passes the increased supply
-//     to mint_proportional or burn_share. The methods here cannot compute
-//     that fee in general: mint_initial(R0, R1) + minimum_liquidity() gives
-//     rootK only when R0*R1 >= 1001^2, 5*rootK + rootKLast can exceed a
-//     u32, and kLast is a 64-bit product, so a pool that charges the fee
-//     needs its own wide arithmetic.
-//   - Swaps that are not one-sided. The k checks take one input side and one
-//     output side. A swap that pays in on its output side (V2's flash swap
-//     repaid in the borrowed token), or that pays in or out on both sides,
-//     has no check here: the pool refuses it or computes V2's two-sided
-//     check itself. The test balance_out > reserve_out - amount1Out, given
-//     with k_holds_with_fee above, detects a swap that pays in on its output
-//     side.
-//   - The price accumulators (price0CumulativeLast, price1CumulativeLast)
-//     that V2's _update maintains.
+// How a pool calls these methods is docs/integration.md. In short: the k
+// checks take balance changes, measured after the transfers (amount_in is
+// the input side's balance minus its stored reserve, amount_out the output
+// side's stored reserve minus its balance); the total_supply that
+// mint_proportional and burn_share receive counts the 1000 units
+// mint_initial locks; and V2's protocol fee, its swaps that pay in on the
+// output side and its price accumulators have no method here.
 //
 // Refusals. Each row maps a trap, or for the k checks a false result, to the
 // V2 require or revert it mirrors: UniswapV2Library's for get_amount_out,
@@ -222,23 +171,19 @@
 // Specifications. The PairMath block at the end of this file states the
 // methods' properties as proof obligations. The comment above it explains
 // how to read one and lists the properties it deliberately does not claim.
-// A proof-mode build of this file,
-//   infc src/main.inf --target wasm32 -v --out-dir proof
-// translates them to Rocq as main__PairMath_hspec1 onwards under Theorem
+// proofs/generate.sh builds this file in proof mode at the wasm32 target
+// (the stellar target refuses proof mode) and writes proofs/main.v, which
+// states them in Rocq as main__PairMath_hspec1 onwards under Theorem
 // valid_main__PairMath (model.inf's WideArith block becomes
 // valid_main__model_WideArith). hspecN is the Nth spec function of its
 // block, counting from 1, and each spec function's comment names its own.
-// Build the proof with infc, not with `infs build -v`: this project's stellar
-// target refuses proof mode, and the failed build empties out/ (restore
-// out/main.wasm with `infs build`). Give infc any --out-dir but out/, which
-// is also its default: there the proof module's main.wasm replaces the
-// contract, and the build still succeeds. `infs install` puts infc on the
-// PATH, in ~/.inference/bin. The proof build checks that every claim is
-// well-formed, not that it is true: the emitted theorems end in Admitted
-// until a proof discharges them, and a false claim compiles just as
-// cleanly. The proof module's executable functions are byte-identical to
-// the deployed contract's; the Stellar value-ABI wrappers the compiler adds
-// around the 11 exports are outside every obligation.
+// The proof build checks that every claim is well-formed, not that it is
+// true: the emitted theorems end in Admitted until a proof discharges them,
+// and a false claim compiles just as cleanly, which is why tests/specs.rs
+// evaluates every claim numerically. The proof module's executable
+// functions are byte-identical to the deployed contract's; the Stellar
+// value-ABI wrappers the compiler adds around the 11 exports are outside
+// every obligation.
 
 use wide;
 use wide::{U128};

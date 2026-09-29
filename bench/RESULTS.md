@@ -1,4 +1,4 @@
-# 2026-09-28 — toolchain v0.0.6 (4deba32)
+# 2026-09-29 — toolchain v0.0.6 (4deba32)
 
 The first row of `bench/history.jsonl`: `infs` and `infc`
 [v0.0.6](https://github.com/Inferara/inference/releases/tag/v0.0.6), workload
