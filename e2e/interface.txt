@@ -1,0 +1,58 @@
+#[soroban_sdk::contractargs(name = "Args")]
+#[soroban_sdk::contractclient(name = "Client")]
+pub trait Contract {
+    fn minimum_liquidity(env: soroban_sdk::Env) -> u32;
+    fn get_amount_out(
+        env: soroban_sdk::Env,
+        amount_in: u32,
+        reserve_in: u32,
+        reserve_out: u32,
+        fee_bps: u32,
+    ) -> u32;
+    fn get_amount_in(
+        env: soroban_sdk::Env,
+        amount_out: u32,
+        reserve_in: u32,
+        reserve_out: u32,
+        fee_bps: u32,
+    ) -> u32;
+    fn quote(
+        env: soroban_sdk::Env,
+        amount_a: u32,
+        reserve_a: u32,
+        reserve_b: u32,
+    ) -> u32;
+    fn mint_initial(env: soroban_sdk::Env, amount0: u32, amount1: u32) -> u32;
+    fn mint_proportional(
+        env: soroban_sdk::Env,
+        amount0: u32,
+        amount1: u32,
+        reserve0: u32,
+        reserve1: u32,
+        total_supply: u32,
+    ) -> u32;
+    fn burn_share(
+        env: soroban_sdk::Env,
+        liquidity: u32,
+        balance: u32,
+        total_supply: u32,
+    ) -> u32;
+    fn k_holds(
+        env: soroban_sdk::Env,
+        amount_in: u32,
+        amount_out: u32,
+        reserve_in: u32,
+        reserve_out: u32,
+    ) -> bool;
+    fn k_holds_with_fee(
+        env: soroban_sdk::Env,
+        amount_in: u32,
+        amount_out: u32,
+        reserve_in: u32,
+        reserve_out: u32,
+        fee_bps: u32,
+    ) -> bool;
+    fn mul_div(env: soroban_sdk::Env, a: u32, b: u32, denominator: u32) -> u32;
+    fn mul_div_up(env: soroban_sdk::Env, a: u32, b: u32, denominator: u32) -> u32;
+}
+

@@ -1,0 +1,134 @@
+# Contract calls for scripts/e2e-local.sh, one per row, in four tab-separated
+# columns:
+#   method    the contract method
+#   args      its arguments as name=value pairs in parameter order, passed as
+#             `--name value`; - for none
+#   expected  the exact stdout of `stellar contract invoke`, or TRAP: the call
+#             must fail with the WebAssembly trap that every refusal becomes
+#             (UnreachableCodeReached)
+#   note      why the row is here: the Uniswap V2 test it reproduces, the
+#             refusal it triggers (named as in src/main.inf's table) or the
+#             boundary it sits on
+# Every expected value comes from exact integer arithmetic on the formulas in
+# src/main.inf. The v2-core rows scale that suite's 1e18 amounts down to 1e6,
+# so each swap row's expected value is V2's divided by 10^12, rounded down.
+minimum_liquidity	-	1000	V2's MINIMUM_LIQUIDITY
+get_amount_out	amount_in=1000 reserve_in=100000 reserve_out=100000 fee_bps=30	987	reference swap: 1000 in against 100000/100000 at 0.30%
+get_amount_out	amount_in=2 reserve_in=100 reserve_out=100 fee_bps=30	1	v2-periphery getAmountOut(2, 100, 100) = 1
+get_amount_out	amount_in=1000000 reserve_in=5000000 reserve_out=10000000 fee_bps=30	1662497	v2-core swap case 1, scaled from 1e18 to 1e6 (V2: 1662497915624478906)
+get_amount_out	amount_in=1000000 reserve_in=10000000 reserve_out=5000000 fee_bps=30	453305	v2-core swap case 2, scaled from 1e18 to 1e6 (V2: 453305446940074565)
+get_amount_out	amount_in=2000000 reserve_in=5000000 reserve_out=10000000 fee_bps=30	2851015	v2-core swap case 3, scaled from 1e18 to 1e6 (V2: 2851015155847869602)
+get_amount_out	amount_in=2000000 reserve_in=10000000 reserve_out=5000000 fee_bps=30	831248	v2-core swap case 4, scaled from 1e18 to 1e6 (V2: 831248957812239453)
+get_amount_out	amount_in=1000000 reserve_in=10000000 reserve_out=10000000 fee_bps=30	906610	v2-core swap case 5, scaled from 1e18 to 1e6 (V2: 906610893880149131)
+get_amount_out	amount_in=1000000 reserve_in=100000000 reserve_out=100000000 fee_bps=30	987158	v2-core swap case 6, scaled from 1e18 to 1e6 (V2: 987158034397061298)
+get_amount_out	amount_in=1000000 reserve_in=1000000000 reserve_out=1000000000 fee_bps=30	996006	v2-core swap case 7, scaled from 1e18 to 1e6 (V2: 996006981039903216)
+get_amount_out	amount_in=1 reserve_in=1000000 reserve_out=1000 fee_bps=30	0	rounds down to zero
+get_amount_out	amount_in=1000 reserve_in=100000 reserve_out=100000 fee_bps=0	990	fee 0
+get_amount_out	amount_in=10000000 reserve_in=100000 reserve_out=100000 fee_bps=9999	990	fee 9999: only 1 bp of the input counts
+get_amount_out	amount_in=4294967295 reserve_in=4294967295 reserve_out=4294967295 fee_bps=30	2144257582	u32 maximum everywhere
+get_amount_out	amount_in=4294967295 reserve_in=1 reserve_out=4294967295 fee_bps=0	4294967294	largest output: one below reserve_out
+get_amount_out	amount_in=0 reserve_in=100000 reserve_out=100000 fee_bps=30	TRAP	INSUFFICIENT_INPUT_AMOUNT
+get_amount_out	amount_in=1000 reserve_in=0 reserve_out=100000 fee_bps=30	TRAP	INSUFFICIENT_LIQUIDITY (reserve_in)
+get_amount_out	amount_in=1000 reserve_in=100000 reserve_out=0 fee_bps=30	TRAP	INSUFFICIENT_LIQUIDITY (reserve_out)
+get_amount_out	amount_in=1000 reserve_in=100000 reserve_out=100000 fee_bps=10000	TRAP	fee_bps = 10000
+get_amount_out	amount_in=1000 reserve_in=100000 reserve_out=100000 fee_bps=4294967295	TRAP	fee_bps = u32 maximum
+get_amount_in	amount_out=987 reserve_in=100000 reserve_out=100000 fee_bps=30	1000	reference swap inverted
+get_amount_in	amount_out=1 reserve_in=100 reserve_out=100 fee_bps=30	2	v2-periphery getAmountIn(1, 100, 100) = 2
+get_amount_in	amount_out=50 reserve_in=100 reserve_out=100 fee_bps=0	101	exact division: V2's +1 is one more than needed
+get_amount_in	amount_out=990 reserve_in=100000 reserve_out=100000 fee_bps=0	1000	fee 0
+get_amount_in	amount_out=1 reserve_in=100000 reserve_out=100000 fee_bps=9999	10001	fee 9999
+get_amount_in	amount_out=1 reserve_in=4294967295 reserve_out=4294967295 fee_bps=0	2	u32 maximum reserves
+get_amount_in	amount_out=1 reserve_in=4294967294 reserve_out=2 fee_bps=0	4294967295	result 4294967295: quotient 4294967294 plus 1
+get_amount_in	amount_out=1 reserve_in=4294967295 reserve_out=2 fee_bps=0	TRAP	quotient 4294967295: the checked +1 overflows
+get_amount_in	amount_out=2 reserve_in=4294967295 reserve_out=3 fee_bps=0	TRAP	quotient does not fit a u32
+get_amount_in	amount_out=4294967294 reserve_in=4294967295 reserve_out=4294967295 fee_bps=30	TRAP	draining all but one unit: quotient does not fit
+get_amount_in	amount_out=0 reserve_in=100000 reserve_out=100000 fee_bps=30	TRAP	INSUFFICIENT_OUTPUT_AMOUNT
+get_amount_in	amount_out=987 reserve_in=0 reserve_out=100000 fee_bps=30	TRAP	INSUFFICIENT_LIQUIDITY (reserve_in)
+get_amount_in	amount_out=987 reserve_in=100000 reserve_out=0 fee_bps=30	TRAP	INSUFFICIENT_LIQUIDITY (reserve_out)
+get_amount_in	amount_out=100000 reserve_in=100000 reserve_out=100000 fee_bps=30	TRAP	amount_out = reserve_out
+get_amount_in	amount_out=100001 reserve_in=100000 reserve_out=100000 fee_bps=30	TRAP	amount_out > reserve_out (ds-math-sub-underflow)
+get_amount_in	amount_out=987 reserve_in=100000 reserve_out=100000 fee_bps=10000	TRAP	fee_bps = 10000
+quote	amount_a=1 reserve_a=100 reserve_b=200	2	v2-periphery quote(1, 100, 200) = 2
+quote	amount_a=2 reserve_a=200 reserve_b=100	1	v2-periphery quote(2, 200, 100) = 1
+quote	amount_a=100 reserve_a=1000 reserve_b=3000	300	three to one
+quote	amount_a=1 reserve_a=3 reserve_b=2	0	rounds down to zero
+quote	amount_a=4294967295 reserve_a=4294967295 reserve_b=4294967295	4294967295	u32 maximum everywhere
+quote	amount_a=4294967295 reserve_a=4294967295 reserve_b=1	1	u32 maximum amount and reserve_a
+quote	amount_a=4294967295 reserve_a=1 reserve_b=2	TRAP	result does not fit a u32
+quote	amount_a=0 reserve_a=100 reserve_b=200	TRAP	INSUFFICIENT_AMOUNT
+quote	amount_a=1 reserve_a=0 reserve_b=200	TRAP	INSUFFICIENT_LIQUIDITY (reserve_a)
+quote	amount_a=1 reserve_a=100 reserve_b=0	TRAP	INSUFFICIENT_LIQUIDITY (reserve_b)
+mint_initial	amount0=1000000 amount1=4000000	1999000	v2-core mint test, scaled from 1e18 to 1e6: sqrt(1e6 * 4e6) - 1000
+mint_initial	amount0=1001 amount1=1001	1	smallest positive mint
+mint_initial	amount0=1 amount1=1002001	1	smallest positive mint, lopsided
+mint_initial	amount0=4294967295 amount1=4294967295	4294966295	u32 maximum
+mint_initial	amount0=4294967295 amount1=1	64535	floor(sqrt(4294967295)) = 65535
+mint_initial	amount0=1000 amount1=1000	TRAP	INSUFFICIENT_LIQUIDITY_MINTED: sqrt is exactly 1000
+mint_initial	amount0=1002000 amount1=1	TRAP	INSUFFICIENT_LIQUIDITY_MINTED: floor(sqrt) is 1000
+mint_initial	amount0=999 amount1=999	TRAP	ds-math-sub-underflow: sqrt below 1000
+mint_initial	amount0=0 amount1=4294967295	TRAP	ds-math-sub-underflow: zero deposit
+mint_proportional	amount0=100000 amount1=400000 reserve0=1000000 reserve1=4000000 total_supply=2000000	200000	balanced deposit into the mint_initial pool
+mint_proportional	amount0=100000 amount1=100000 reserve0=1000000 reserve1=4000000 total_supply=2000000	50000	unbalanced deposit: the smaller share
+mint_proportional	amount0=2 amount1=2 reserve0=3 reserve1=3 total_supply=2	1	rounds down to one
+mint_proportional	amount0=4294967295 amount1=1 reserve0=1 reserve1=1 total_supply=2	2	first share does not fit, second is minted
+mint_proportional	amount0=1 amount1=4294967295 reserve0=1 reserve1=1 total_supply=2	2	second share does not fit, first is minted
+mint_proportional	amount0=4294967295 amount1=4294967295 reserve0=4294967295 reserve1=4294967295 total_supply=4294967295	4294967295	u32 maximum everywhere
+mint_proportional	amount0=4294967295 amount1=4294967295 reserve0=1 reserve1=1 total_supply=2	TRAP	neither share fits a u32
+mint_proportional	amount0=1 amount1=1 reserve0=3 reserve1=3 total_supply=2	TRAP	INSUFFICIENT_LIQUIDITY_MINTED: rounds down to zero
+mint_proportional	amount0=0 amount1=100 reserve0=1000 reserve1=1000 total_supply=1000	TRAP	INSUFFICIENT_LIQUIDITY_MINTED: zero amount0
+mint_proportional	amount0=100 amount1=100 reserve0=0 reserve1=1000 total_supply=1000	TRAP	zero reserve0
+mint_proportional	amount0=100 amount1=100 reserve0=1000 reserve1=0 total_supply=1000	TRAP	zero reserve1
+mint_proportional	amount0=100 amount1=100 reserve0=1000 reserve1=1000 total_supply=0	TRAP	zero total_supply
+burn_share	liquidity=1000 balance=100000 total_supply=2000	50000	half the supply takes half the balance
+burn_share	liquidity=1 balance=3 total_supply=2	1	rounds down to one
+burn_share	liquidity=5 balance=7 total_supply=5	7	the whole supply takes the whole balance
+burn_share	liquidity=4294967295 balance=4294967295 total_supply=4294967295	4294967295	u32 maximum everywhere
+burn_share	liquidity=4294967294 balance=4294967295 total_supply=4294967295	4294967294	all but one unit of a u32-maximum supply
+burn_share	liquidity=1 balance=1 total_supply=2	TRAP	INSUFFICIENT_LIQUIDITY_BURNED: rounds down to zero
+burn_share	liquidity=0 balance=100 total_supply=100	TRAP	INSUFFICIENT_LIQUIDITY_BURNED: zero liquidity
+burn_share	liquidity=10 balance=0 total_supply=100	TRAP	INSUFFICIENT_LIQUIDITY_BURNED: zero balance
+burn_share	liquidity=3 balance=10 total_supply=2	TRAP	liquidity above total_supply
+burn_share	liquidity=1 balance=10 total_supply=0	TRAP	zero total_supply
+k_holds	amount_in=10 amount_out=9 reserve_in=1000 reserve_out=1000	true	product grows
+k_holds	amount_in=10 amount_out=10 reserve_in=1000 reserve_out=1000	false	product falls
+k_holds	amount_in=100 amount_out=50 reserve_in=100 reserve_out=100	true	product unchanged
+k_holds	amount_in=0 amount_out=0 reserve_in=1000 reserve_out=1000	true	zero amount_out holds (the pool must refuse it)
+k_holds	amount_in=0 amount_out=1 reserve_in=1000 reserve_out=1000	false	zero amount_in with a positive amount_out
+k_holds	amount_in=4294967295 amount_out=4294967294 reserve_in=1 reserve_out=4294967295	true	u32 maximum amount_in and reserve_out
+k_holds	amount_in=0 amount_out=1 reserve_in=4294967295 reserve_out=4294967295	false	u32 maximum reserves, one unit out for nothing
+k_holds	amount_in=3146359994 amount_out=65536 reserve_in=4294909253 reserve_out=4294924745	true	the products first differ in limb 2 (bits 64-95): limb 1 alone would say false
+k_holds	amount_in=1 amount_out=0 reserve_in=0 reserve_out=1000	TRAP	swap INSUFFICIENT_LIQUIDITY: zero reserve_in
+k_holds	amount_in=10 amount_out=1000 reserve_in=1000 reserve_out=1000	TRAP	K: amount_out = reserve_out
+k_holds	amount_in=10 amount_out=1001 reserve_in=1000 reserve_out=1000	TRAP	K: amount_out > reserve_out
+k_holds_with_fee	amount_in=1000 amount_out=987 reserve_in=100000 reserve_out=100000 fee_bps=30	true	reference swap
+k_holds_with_fee	amount_in=1000 amount_out=988 reserve_in=100000 reserve_out=100000 fee_bps=30	false	reference swap, one unit too many out
+k_holds_with_fee	amount_in=1000 amount_out=1 reserve_in=997 reserve_out=2 fee_bps=30	true	fee 30, adjusted product exactly unchanged: V2's K accepts equality
+k_holds_with_fee	amount_in=999 amount_out=1 reserve_in=997 reserve_out=2 fee_bps=30	false	fee 30, one unit of amount_in short of an unchanged product
+k_holds_with_fee	amount_in=10 amount_out=9 reserve_in=1000 reserve_out=1000 fee_bps=0	true	fee 0, product grows
+k_holds_with_fee	amount_in=10 amount_out=10 reserve_in=1000 reserve_out=1000 fee_bps=0	false	fee 0, product falls
+k_holds_with_fee	amount_in=100 amount_out=50 reserve_in=100 reserve_out=100 fee_bps=0	true	fee 0, product unchanged
+k_holds_with_fee	amount_in=0 amount_out=0 reserve_in=1000 reserve_out=1000 fee_bps=30	true	zero amount_out holds (the pool must refuse it)
+k_holds_with_fee	amount_in=10000000 amount_out=990 reserve_in=100000 reserve_out=100000 fee_bps=9999	true	fee 9999
+k_holds_with_fee	amount_in=10000000 amount_out=991 reserve_in=100000 reserve_out=100000 fee_bps=9999	false	fee 9999, one unit too many out
+k_holds_with_fee	amount_in=4294967295 amount_out=4294967294 reserve_in=1 reserve_out=4294967295 fee_bps=0	true	u32 maximum, fee 0
+k_holds_with_fee	amount_in=4294967295 amount_out=4294967294 reserve_in=1 reserve_out=4294967295 fee_bps=9999	false	u32 maximum, fee 9999
+k_holds_with_fee	amount_in=3146359994 amount_out=65536 reserve_in=4294909253 reserve_out=4294924745 fee_bps=30	true	the adjusted products first differ in limb 2 (bits 64-95): limb 1 alone would say false
+k_holds_with_fee	amount_in=1000 amount_out=987 reserve_in=100000 reserve_out=100000 fee_bps=10000	TRAP	fee_bps = 10000
+k_holds_with_fee	amount_in=1000 amount_out=987 reserve_in=0 reserve_out=100000 fee_bps=30	TRAP	swap INSUFFICIENT_LIQUIDITY: zero reserve_in
+k_holds_with_fee	amount_in=1000 amount_out=100000 reserve_in=100000 reserve_out=100000 fee_bps=30	TRAP	K: amount_out = reserve_out
+mul_div	a=6 b=7 denominator=4	10	rounds down
+mul_div	a=0 b=5 denominator=3	0	zero product
+mul_div	a=65536 b=65535 denominator=1	4294901760	65536 * 65535 = 4294901760 fits
+mul_div	a=4294967295 b=4294967295 denominator=4294967295	4294967295	u32 maximum everywhere
+mul_div	a=65536 b=65536 denominator=1	TRAP	result 2^32 does not fit
+mul_div	a=4294967295 b=4294967295 denominator=4294967294	TRAP	result just above the u32 maximum
+mul_div	a=6 b=7 denominator=0	TRAP	zero denominator
+mul_div_up	a=6 b=7 denominator=4	11	rounds up
+mul_div_up	a=6 b=8 denominator=4	12	exact division is not rounded
+mul_div_up	a=0 b=5 denominator=3	0	zero product
+mul_div_up	a=7 b=1227133513 denominator=3	2863311531	rounds up near the top of the range
+mul_div_up	a=1 b=4294967295 denominator=1	4294967295	exact u32 maximum
+mul_div_up	a=4294967295 b=4294967295 denominator=4294967295	4294967295	u32 maximum everywhere
+mul_div_up	a=7 b=1227133513 denominator=2	TRAP	floor is 4294967295 and not exact: the +1 overflows
+mul_div_up	a=65536 b=65536 denominator=1	TRAP	floor 2^32 does not fit
+mul_div_up	a=6 b=7 denominator=0	TRAP	zero denominator
