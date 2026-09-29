@@ -1,0 +1,10 @@
+{
+  "network": "testnet",
+  "contract_id": "CB4WEDZCFTWGFMLCBVYDNS35M6UR67GIEAS47QPZNFMYCQTZECGJ4WZH",
+  "wasm_sha256": "c94ccd43661c74cc40ea03a379aa658a58b4f73a3515495450aeb6d3e856b685",
+  "toolchain_version": "0.0.6",
+  "toolchain_commit": "4deba32",
+  "deployed_at": "2026-09-29T01:58:27Z",
+  "deployer": "GACARGU5CCIEZ4IIUCO32AKLHYFWYKEQGQ2F4AX4OYQRCSBUGAGKZTRB",
+  "live_until_ledger": 8035104
+}
