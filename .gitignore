@@ -2,3 +2,11 @@
 tests/target/
 tests/test_snapshots/
 .ctx/
+compose.override.yaml
+compose.override.yml
+.env
+*.vo
+*.vok
+*.vos
+*.glob
+.*.aux
