@@ -1,0 +1,8 @@
+# Not deployed. A wasm32 build (the default target) that exports scalar views
+# of the contract's src/wide.inf and src/model.inf. Its src/ holds copies of
+# those two files, which must stay byte-identical to the contract's; the
+# header of src/main.inf here says why they are copies and how to check them.
+[package]
+name = "stellar-amm-math-shell"
+version = "0.1.0"
+infc_version = "0.0.6"

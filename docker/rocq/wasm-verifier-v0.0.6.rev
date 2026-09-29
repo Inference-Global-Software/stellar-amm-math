@@ -1,0 +1,4 @@
+# The wasm-verifier revision that Inference v0.0.6 pins: the `revision` line
+# of core/wasm-to-v/wasm-verifier-pin.txt at tag v0.0.6 in Inferara/inference.
+# The v0.0.6 compiler emits .v files against this revision of the library.
+8f485f037a270271bf2e1393c24fc0684097163b

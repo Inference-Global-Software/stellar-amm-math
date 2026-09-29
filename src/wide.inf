@@ -1,0 +1,259 @@
+// 128-bit unsigned integers as four u32 limbs, for the pair math in main.inf.
+//
+// Uniswap V2 forms products such as amount_in * 997 * reserve_out in 256-bit
+// integers before it divides. Inference has no integer type wider than 64
+// bits, so every product and quotient the contract needs is built here from
+// u32 operations. A value is U128 { w0, w1, w2, w3 }, which stands for
+// w0 + w1 * 2^32 + w2 * 2^64 + w3 * 2^96 (w0 is the least significant limb).
+// The 11 methods take u32 operands, and their largest intermediate, the left
+// side of k_holds_with_fee (a 47-bit fee-adjusted balance times
+// reserve_out - amount_out, a u32), stays below 2^79. model.inf's
+// mul_by_limb, which only the specifications call, goes up to about 2^96 (a
+// 64-bit value times a u32). Both fit in 128 bits with room to spare.
+//
+// Every arithmetic operation returns the exact result or traps; nothing here
+// wraps silently (shl1_or's bit argument is the caller's to keep at 0 or 1).
+// add and sub run limbs 0-2 under wrapping(...) and recover each carry or
+// borrow with an unsigned compare (a wrapped sum is smaller than an operand
+// exactly when it carried). Their top limb stays checked, so a result
+// outside 0..2^128-1 traps instead of wrapping. mul_by asserts that its top
+// partial product fits and sums the rest through add, so an overflowing
+// product traps too.
+//
+// No executable function in the contract uses / or %: those in main.inf
+// appear only inside its PairMath specification, which the deployed module
+// does not contain. Every quotient the methods compute comes from
+// div_to_u32's shift-and-subtract loop, whose leading assert also refuses a
+// zero denominator. Dividing by zero is therefore the same assert trap as
+// every other refusal, never the machine's own divide-by-zero trap. The
+// deployed module does hold four i32.div_u instructions: they are the
+// compiler's overflow checks on mul32's column products, and each one runs
+// only after its divisor has tested nonzero.
+//
+// The language imposes these rules on this file:
+//   - There are no numeric conversions, not even from bool to u32, so a carry
+//     is materialised as `if s < a { c = 1; }`.
+//   - A call that returns a compound value may appear only as a `let`
+//     initializer or a `return` operand (A016, A017), so every intermediate
+//     U128 is bound to a name before it is used.
+//   - A name is declared once per function body, even across disjoint blocks
+//     (A041). With the rule above, `r = shl1_or(r, bit);` is refused (A017)
+//     and `let r = ...` would redeclare r, so the division loop binds each
+//     step to a fresh name (shifted, reduced) and copies it into r.
+//   - A struct literal cannot be passed straight to a function (A012), which
+//     is why mul_by binds x0..x3 and model.inf binds n before each call.
+//   - `loop c { ... }` repeats while c holds (Rust's `while c`); there is no
+//     `while` or `for` keyword, and every loop here has a fixed bound of 32.
+//   - `return` may not appear inside a loop (A003); the loops accumulate into
+//     mutable locals and return after them.
+//   - Integer literals are decimal only, and a `const` is declared inside the
+//     function that uses it (A032 refuses top-level constants).
+//   - Never compare two U128 values with == or !=. In executable code the
+//     compiler compares the operands' frame addresses
+//     (Inferara/inference#384), so two equal values held in different locals
+//     compare unequal. In a specification, == between two U128 locals drawn
+//     with @ compares their limbs. Compare with eq() instead.
+
+pub struct U128 {
+    w0: u32;
+    w1: u32;
+    w2: u32;
+    w3: u32;
+}
+
+// x as a U128. Never traps.
+pub fn from_u32(x: u32) -> U128 {
+    return U128 { w0: x, w1: 0, w2: 0, w3: 0 };
+}
+
+// The exact 64-bit product a * b in limbs 0-1 (limbs 2-3 are zero), built
+// from four 16-bit column products. Every intermediate stays below 2^32, so
+// none of the checked operators here can trap: the function never traps.
+pub fn mul32(a: u32, b: u32) -> U128 {
+    const LOW16: u32 = 65535;
+    let al: u32 = a & LOW16;
+    let ah: u32 = a >> 16;
+    let bl: u32 = b & LOW16;
+    let bh: u32 = b >> 16;
+    let ll: u32 = al * bl;
+    let lh: u32 = al * bh;
+    let hl: u32 = ah * bl;
+    let hh: u32 = ah * bh;
+    let mid1: u32 = lh + (ll >> 16);
+    let mid2: u32 = hl + (mid1 & LOW16);
+    let lo: u32 = ((mid2 & LOW16) << 16) | (ll & LOW16);
+    let hi: u32 = hh + (mid1 >> 16) + (mid2 >> 16);
+    return U128 { w0: lo, w1: hi, w2: 0, w3: 0 };
+}
+
+// a + b. Traps when the sum is 2^128 or more (the checked top limb overflows).
+pub fn add(a: U128, b: U128) -> U128 {
+    let s0: u32 = wrapping(a.w0 + b.w0);
+    let mut c0: u32 = 0;
+    if s0 < a.w0 {
+        c0 = 1;
+    }
+    let t1: u32 = wrapping(a.w1 + b.w1);
+    let s1: u32 = wrapping(t1 + c0);
+    let mut c1: u32 = 0;
+    if t1 < a.w1 {
+        c1 = 1;
+    }
+    if s1 < t1 {
+        c1 = 1;
+    }
+    let t2: u32 = wrapping(a.w2 + b.w2);
+    let s2: u32 = wrapping(t2 + c1);
+    let mut c2: u32 = 0;
+    if t2 < a.w2 {
+        c2 = 1;
+    }
+    if s2 < t2 {
+        c2 = 1;
+    }
+    let s3: u32 = a.w3 + b.w3 + c2;
+    return U128 { w0: s0, w1: s1, w2: s2, w3: s3 };
+}
+
+// a - b. Traps when b > a (the checked top limb underflows).
+pub fn sub(a: U128, b: U128) -> U128 {
+    let d0: u32 = wrapping(a.w0 - b.w0);
+    let mut br0: u32 = 0;
+    if a.w0 < b.w0 {
+        br0 = 1;
+    }
+    let t1: u32 = wrapping(a.w1 - b.w1);
+    let d1: u32 = wrapping(t1 - br0);
+    let mut br1: u32 = 0;
+    if a.w1 < b.w1 {
+        br1 = 1;
+    }
+    if t1 < br0 {
+        br1 = 1;
+    }
+    let t2: u32 = wrapping(a.w2 - b.w2);
+    let d2: u32 = wrapping(t2 - br1);
+    let mut br2: u32 = 0;
+    if a.w2 < b.w2 {
+        br2 = 1;
+    }
+    if t2 < br1 {
+        br2 = 1;
+    }
+    let d3: u32 = a.w3 - b.w3 - br2;
+    return U128 { w0: d0, w1: d1, w2: d2, w3: d3 };
+}
+
+// a * m. Traps when the product is 2^128 or more: either the top limb's
+// partial product needs a fifth limb (the assert) or the final add overflows.
+pub fn mul_by(a: U128, m: u32) -> U128 {
+    let p0: U128 = mul32(a.w0, m);
+    let p1: U128 = mul32(a.w1, m);
+    let p2: U128 = mul32(a.w2, m);
+    let p3: U128 = mul32(a.w3, m);
+    assert(p3.w1 == 0);
+    let x0: U128 = U128 { w0: p0.w0, w1: p0.w1, w2: 0, w3: 0 };
+    let x1: U128 = U128 { w0: 0, w1: p1.w0, w2: p1.w1, w3: 0 };
+    let x2: U128 = U128 { w0: 0, w1: 0, w2: p2.w0, w3: p2.w1 };
+    let x3: U128 = U128 { w0: 0, w1: 0, w2: 0, w3: p3.w0 };
+    let s01: U128 = add(x0, x1);
+    let s012: U128 = add(s01, x2);
+    return add(s012, x3);
+}
+
+// Whether a and b hold the same value, limb by limb. Never traps.
+pub fn eq(a: U128, b: U128) -> bool {
+    return a.w0 == b.w0 && a.w1 == b.w1 && a.w2 == b.w2 && a.w3 == b.w3;
+}
+
+// a < b, deciding on the most significant limb that differs. Never traps.
+pub fn lt(a: U128, b: U128) -> bool {
+    if a.w3 != b.w3 {
+        return a.w3 < b.w3;
+    }
+    if a.w2 != b.w2 {
+        return a.w2 < b.w2;
+    }
+    if a.w1 != b.w1 {
+        return a.w1 < b.w1;
+    }
+    return a.w0 < b.w0;
+}
+
+// a <= b. Never traps.
+pub fn le(a: U128, b: U128) -> bool {
+    return !lt(b, a);
+}
+
+// floor(a / 2^32). Never traps.
+pub fn shr32(a: U128) -> U128 {
+    return U128 { w0: a.w1, w1: a.w2, w2: a.w3, w3: 0 };
+}
+
+// (a << 1) | bit, for bit 0 or 1 (a larger bit is OR-ed into limb 0 as it
+// stands). Traps when a's top bit is set, since the shift would drop it.
+pub fn shl1_or(a: U128, bit: u32) -> U128 {
+    assert((a.w3 >> 31) == 0);
+    let n0: u32 = (a.w0 << 1) | bit;
+    let n1: u32 = (a.w1 << 1) | (a.w0 >> 31);
+    let n2: u32 = (a.w2 << 1) | (a.w1 >> 31);
+    let n3: u32 = (a.w3 << 1) | (a.w2 >> 31);
+    return U128 { w0: n0, w1: n1, w2: n2, w3: n3 };
+}
+
+// Whether floor(n / d) fits a u32, i.e. n < d * 2^32, which for integers is
+// floor(n / 2^32) < d. False when d is zero. Never traps.
+pub fn quotient_fits(n: U128, d: U128) -> bool {
+    let h: U128 = shr32(n);
+    return lt(h, d);
+}
+
+// floor(num / den) as a u32. Precondition: quotient_fits(num, den). Traps
+// when it does not hold, which covers both den = 0 and a quotient of 2^32 or
+// more. The assert calls quotient_fits itself, so a caller that tests
+// quotient_fits first (as mint_proportional does) tests the same predicate.
+//
+// Restoring division over the 32 bits of limb 0, starting from the high part
+// floor(num / 2^32) as the partial remainder; the precondition keeps that
+// remainder below den, so each step yields one quotient bit. The remainder
+// the loop shifts at step i (counting from 0) is at most
+// floor(num / 2^(32-i)) <= floor(num / 2) < 2^127, so shl1_or's assert
+// never fires here.
+pub fn div_to_u32(num: U128, den: U128) -> u32 {
+    assert(quotient_fits(num, den));
+    let mut r: U128 = shr32(num);
+    let mut q: u32 = 0;
+    let mut i: u32 = 0;
+    loop i < 32 {
+        let bit: u32 = (num.w0 >> (31 - i)) & 1;
+        let shifted: U128 = shl1_or(r, bit);
+        q = q << 1;
+        if le(den, shifted) {
+            let reduced: U128 = sub(shifted, den);
+            r = reduced;
+            q = q | 1;
+        } else {
+            r = shifted;
+        }
+        i = i + 1;
+    }
+    return q;
+}
+
+// floor(sqrt(n)) for n < 2^64, by a greedy search from bit 31 down: a
+// candidate bit stays set when the candidate's exact square is still <= n.
+// Traps when n is 2^64 or more (limb 2 or limb 3 nonzero).
+pub fn isqrt(n: U128) -> u32 {
+    assert(n.w2 == 0 && n.w3 == 0);
+    let mut r: u32 = 0;
+    let mut i: u32 = 0;
+    loop i < 32 {
+        let cand: u32 = r | (1 << (31 - i));
+        let sq: U128 = mul32(cand, cand);
+        if le(sq, n) {
+            r = cand;
+        }
+        i = i + 1;
+    }
+    return r;
+}

@@ -1,0 +1,140 @@
+# A local Stellar network, the stellar CLI and two Rocq checkers. The Stellar
+# images are pinned by digest, and the Rocq images are built from docker/rocq/
+# on a digest-pinned base. The scripts in scripts/ and proofs/ drive them,
+# always with `-f compose.yaml`, so that a COMPOSE_FILE or a
+# compose.override.yaml cannot redirect them. By hand, from this directory:
+#
+#   docker compose up -d --wait stellar         start a local network
+#   docker compose run --rm cli <args>          the CLI, on that network by default
+#   docker compose run --rm cli-net <args>      the CLI for testnet (no local network)
+#   docker compose --profile '*' down -v        stop everything and drop the volumes
+#   docker compose --profile '*' down -v --rmi local
+#                                               ... and the Rocq images too
+#
+# A plain `down -v` leaves the `stellar-config` volume behind, because only the
+# profiled CLI services use it; `--profile '*'` includes them. No `down` removes
+# the Rocq images unless given `--rmi local`, and none removes Docker's build
+# cache, which also holds what the images were built from.
+#
+# COMPOSE_PROJECT_NAME renames the project, with its containers, volumes and
+# Rocq images (PROJECT-rocq-stub, PROJECT-rocq-real), and STELLAR_PORT moves
+# the local network's port on the host's loopback interface (default 8000),
+# so two checkouts can run side by side. No script uses that port: the CLI
+# reaches the network from inside its network namespace.
+# WASM_VERIFIER_CONTEXT moves the rocq-real service's library out of
+# .ctx/wasm-verifier (see there).
+#
+# Measured with Docker Compose 2.38.2 and 5.5.1 on Docker Desktop (macOS);
+# no version is checked or refused. Untested on SELinux hosts, where the
+# ./out bind mounts may need the `z` option to be readable.
+name: stellar-amm-math
+
+services:
+  # A standalone network at protocol 28: stellar-core and RPC v28.0.1, and
+  # friendbot. Horizon is left out: the CLI talks to RPC only, and without it
+  # (and its PostgreSQL) the container uses about half the memory.
+  stellar:
+    image: stellar/quickstart:v669-b1438.1-latest@sha256:bed2d4b5fa0bc569ec2214eb6e58312e6b09eb230c5194bcb0eec59a89a5399c
+    command: ["--local", "--enable", "core,rpc"]
+    ports:
+      - "127.0.0.1:${STELLAR_PORT:-8000}:8000"
+    healthcheck:
+      # Healthy once RPC reports "healthy" AND friendbot answers. GET /friendbot
+      # without ?addr= funds nothing: friendbot answers with a problem JSON that
+      # names the missing field, while nginx answers a non-JSON 502 until
+      # friendbot has started.
+      test:
+        - CMD-SHELL
+        - >-
+          curl -sS -X POST -H 'Content-Type: application/json'
+          -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+          http://localhost:8000/rpc | jq -e '.result.status == "healthy"' >/dev/null
+          && curl -sS http://localhost:8000/friendbot | jq -e '.extras.invalid_field == "addr"' >/dev/null
+      interval: 2s
+      timeout: 5s
+      retries: 150
+      start_period: 5s
+
+  # The CLI on the local network. It shares the network namespace of `stellar`,
+  # so the CLI's built-in `local` network (http://localhost:8000/rpc) reaches it
+  # with no configuration. Never set STELLAR_RPC_URL here: it silently
+  # overrides an explicit `--network testnet`.
+  cli:
+    image: stellar/stellar-cli:28.0.0@sha256:bc1073aecfc5dd0974b76331162c7fff09b7793cd8aaa79b3a1d918363937f05
+    profiles: ["tools"]
+    network_mode: "service:stellar"
+    working_dir: /work
+    volumes:
+      # Only out/, which holds the one file the scripts hand the CLI
+      # (out/main.wasm), and read-only: the image runs as uid 1000, which
+      # cannot write to a checkout owned by another uid (a GitHub runner's is
+      # 1001), so commands that produce a file write it to stdout instead
+      # (`contract fetch --id ID > x.wasm`). A bind mount needs a Docker
+      # daemon that sees this checkout at its own path: not a remote daemon,
+      # nor docker-outside-of-docker from a container whose workspace path
+      # differs.
+      - ./out:/work/out:ro
+      # Identities (`keys generate`) live here.
+      - stellar-config:/config
+    environment:
+      STELLAR_NETWORK: local
+    depends_on:
+      stellar:
+        condition: service_healthy
+
+  # The CLI for public networks. It does not depend on `stellar`, and it shares
+  # the mount and the identities of `cli`.
+  cli-net:
+    image: stellar/stellar-cli:28.0.0@sha256:bc1073aecfc5dd0974b76331162c7fff09b7793cd8aaa79b3a1d918363937f05
+    profiles: ["tools"]
+    working_dir: /work
+    volumes:
+      - ./out:/work/out:ro
+      - stellar-config:/config
+    environment:
+      STELLAR_NETWORK: testnet
+
+  # Type-checks a .v file against the public signature stub that
+  # Inferara/inference ships at a release tag. proofs/check.sh stub stages the
+  # stub in .ctx/rocq-stub (scripts/fetch-rocq-stub.sh) and runs this with
+  # main.v on stdin, so it mounts nothing; by hand:
+  #   docker compose --profile rocq run --rm -T rocq-stub --stdin main.v < proofs/main.v
+  # The image has no `image:` name, so it is named after the project, and
+  # `pull_policy: build` rebuilds it (from cache, in seconds) before every
+  # run, so that a run always uses what .ctx/ holds now.
+  rocq-stub:
+    profiles: ["rocq"]
+    build:
+      context: ./docker/rocq
+      target: stub
+      additional_contexts:
+        rocq-stub: ./.ctx/rocq-stub
+    pull_policy: build
+    platform: linux/amd64 # coqorg/coq publishes amd64 only
+    network_mode: none
+
+  # Type-checks a .v file against coq-wasm and the wasm-verifier library the
+  # toolchain pins. proofs/check.sh real runs this once
+  # scripts/stage-wasm-verifier.sh has staged the library in .ctx/wasm-verifier,
+  # or in the directory WASM_VERIFIER_CONTEXT names (best an absolute path:
+  # compose takes a relative one from this file's directory, proofs/check.sh
+  # from the directory it is run from). proofs/check.sh always sets it, to
+  # the directory whose digests it checked, so a WASM_VERIFIER_CONTEXT in
+  # .env applies only to compose commands run by hand.
+  # The library is not public: the image and Docker's build cache hold its
+  # sources, its build log quotes it, and coqc's error on a failing .v file
+  # can quote it. Never push the image, and never build or run this service
+  # in CI; proofs/check.sh says who may run it and how to remove every copy.
+  rocq-real:
+    profiles: ["rocq-real"]
+    build:
+      context: ./docker/rocq
+      target: real
+      additional_contexts:
+        wasm-verifier: ${WASM_VERIFIER_CONTEXT:-./.ctx/wasm-verifier}
+    pull_policy: build
+    platform: linux/amd64
+    network_mode: none
+
+volumes:
+  stellar-config:
