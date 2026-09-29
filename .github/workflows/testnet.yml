@@ -1,0 +1,27 @@
+name: Testnet deployment
+
+# Checks that the contract deployments/testnet.json records is still on
+# testnet, holds the bytes of out/main.wasm and answers
+# get_amount_out(1000, 100000, 100000, 30) = 987. Testnet is reset from time
+# to time; after a reset this fails with "not found" until
+# scripts/deploy-testnet.sh deploys the contract again and the new record is
+# committed. It funds a throwaway key with friendbot and needs no secret.
+
+on:
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  testnet:
+    name: testnet deployment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the deployment
+        run: bash scripts/check-testnet.sh

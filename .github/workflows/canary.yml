@@ -1,0 +1,183 @@
+name: Toolchain canary
+
+# Builds the contract with released Inference toolchains and checks it on the
+# Soroban host. Two toolchains per run:
+#
+#   ledger  the release the last bench/history.jsonl row was recorded with;
+#           out/main.wasm, tests/shell/out/main.wasm and proofs/ must be
+#           exactly what it builds, and the host cost must equal the row's
+#   latest  the newest published release; the weekly run is what notices a
+#           release that stops building this source, changes what a method
+#           returns, or changes its cost (reported in the job summary)
+#
+# The release binaries of infs need glibc 2.38 or newer, hence ubuntu-24.04.
+# The Rocq job checks the stub tier only: the real tier needs a private
+# library and must never run here (see proofs/check.sh).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: canary (${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [ledger, latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ matrix.toolchain }}" = ledger ]; then
+            tag="v$(tail -n 1 bench/history.jsonl | jq -r .toolchain_version)"
+          else
+            tag=$(gh release view -R Inferara/inference --json tagName -q .tagName)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Toolchain: $tag"
+
+      - name: Install infs and infc
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          dir="$RUNNER_TEMP/inference"
+          mkdir -p "$dir" && cd "$dir"
+          gh release download "$TAG" -R Inferara/inference \
+            -p 'infs-linux-x64.tar.gz*' -p 'infc-linux-x64.tar.gz*'
+          sha256sum -c infs-linux-x64.tar.gz.sha256 infc-linux-x64.tar.gz.sha256
+          mkdir infs infc
+          tar xzf infs-linux-x64.tar.gz -C infs
+          tar xzf infc-linux-x64.tar.gz -C infc
+          echo "INFS=$dir/infs/infs" >> "$GITHUB_ENV"
+          echo "INFC_PATH=$dir/infc/infc" >> "$GITHUB_ENV"
+          infs/infs --version
+          infc/infc --version
+          infc/infc --commit-hash
+
+      # Removed first so the checks below can only ever see this build's
+      # output, never the committed files.
+      - name: Build the contract and the test shell
+        run: |
+          rm -f out/main.wasm tests/shell/out/main.wasm
+          "$INFS" build
+          (cd tests/shell && "$INFS" build)
+
+      - name: Proofs are what src/ builds
+        if: matrix.toolchain == 'ledger'
+        run: bash proofs/generate.sh --check
+
+      - name: Rebuild the proofs
+        if: matrix.toolchain == 'latest'
+        run: bash proofs/generate.sh
+
+      - name: Committed modules are this build
+        if: matrix.toolchain == 'ledger'
+        run: |
+          if ! git diff --quiet -- out/main.wasm tests/shell/out/main.wasm; then
+            git diff --stat -- out/main.wasm tests/shell/out/main.wasm
+            echo "::error::out/main.wasm or tests/shell/out/main.wasm is not what src/ builds to under the ledger toolchain; rebuild and commit it."
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests
+
+      # The ledger leg includes the ignored test that requires a
+      # bench/history.jsonl row for this exact build, its host cost included.
+      - name: Host tests
+        working-directory: tests
+        run: |
+          rustc --version
+          if [ "${{ matrix.toolchain }}" = ledger ]; then
+            cargo test --locked --no-fail-fast -- --include-ignored
+          else
+            cargo test --locked --no-fail-fast
+          fi
+
+      - name: Cost against the ledger (informational)
+        if: matrix.toolchain == 'latest'
+        working-directory: tests
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          status=0
+          cargo test --locked --test repo -- --ignored the_ledger_records_the_committed_build \
+            > "$RUNNER_TEMP/ledger.log" 2>&1 || status=$?
+          {
+            echo "### $TAG against the last ledger row"
+            echo
+            if [ "$status" -eq 0 ]; then
+              echo "The build, its proofs and its host cost are what the ledger records."
+            else
+              echo "This toolchain's build differs from every ledger row:"
+              echo
+              echo '```'
+              sed -n '/has no row for the committed build/,/^$/p' "$RUNNER_TEMP/ledger.log"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rocq:
+    name: rocq stub (${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [ledger, latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ matrix.toolchain }}" = ledger ]; then
+            tag="v$(tail -n 1 bench/history.jsonl | jq -r .toolchain_version)"
+          else
+            tag=$(gh release view -R Inferara/inference --json tagName -q .tagName)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Toolchain: $tag"
+
+      - name: Install infc
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          dir="$RUNNER_TEMP/inference"
+          mkdir -p "$dir" && cd "$dir"
+          gh release download "$TAG" -R Inferara/inference -p 'infc-linux-x64.tar.gz*'
+          sha256sum -c infc-linux-x64.tar.gz.sha256
+          mkdir infc
+          tar xzf infc-linux-x64.tar.gz -C infc
+          echo "INFC_PATH=$dir/infc/infc" >> "$GITHUB_ENV"
+          infc/infc --version
+
+      - name: Rebuild the proofs
+        run: bash proofs/generate.sh
+
+      # The stub of the leg's own release, so a translator change is checked
+      # against the stub it was written for. A tag with no
+      # docker/rocq/stub-TAG.sha256 is checked UNVERIFIED, with a warning.
+      - name: Type-check main.v against the stub
+        env:
+          ROCQ_STUB_TAG: ${{ steps.release.outputs.tag }}
+        run: bash proofs/check.sh stub --self-test
